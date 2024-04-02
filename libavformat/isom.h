@@ -309,8 +309,8 @@ typedef struct MOVContext {
     void *audible_iv;
     int audible_iv_size;
     struct AVAES *aes_decrypt;
-    uint8_t *decryption_key;
-    int decryption_key_len;
+    uint8_t *decryption_default_key;
+    int decryption_default_key_len;
     int enable_drefs;
     int32_t movie_display_matrix[3][3]; ///< display matrix from mvhd
     int have_read_mfra_size;
@@ -318,6 +318,14 @@ typedef struct MOVContext {
     uint32_t max_stts_delta;
     int is_still_picture_avif;
     int primary_item_id;
+    struct {
+        int item_id;
+        int extent_length;
+        int64_t extent_offset;
+    } *avif_info;
+    int avif_info_size;
+    int interleaved_read;
+    AVDictionary* decryption_keys;
 } MOVContext;
 
 int ff_mp4_read_descr_len(AVIOContext *pb);
