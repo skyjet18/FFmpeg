@@ -115,6 +115,9 @@ struct representation {
     uint32_t init_sec_buf_read_offset;
     int64_t cur_timestamp;
     int is_restart_needed;
+
+    char *cenc_decryption_key;
+    char *cenc_decryption_keys;
 };
 
 typedef struct DASHContext {
@@ -152,6 +155,8 @@ typedef struct DASHContext {
     int max_url_size;
     char *cenc_decryption_key;
     char *cenc_decryption_keys;
+    char *cenc_decryption_video_key;
+    char *cenc_decryption_audio_key;
 
     /* Flags for init section*/
     int is_init_section_common_video;
@@ -363,6 +368,8 @@ static void free_representation(struct representation *pls)
     av_freep(&pls->url_template);
     av_freep(&pls->lang);
     av_freep(&pls->id);
+    av_freep(&pls->cenc_decryption_key);
+    av_freep(&pls->cenc_decryption_keys);
     av_freep(&pls);
 }
 
@@ -876,6 +883,7 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
             return AVERROR(ENOMEM);
         }
     }
+
     rep->parent = s;
     representation_segmenttemplate_node = find_child_node_by_name(representation_node, "SegmentTemplate");
     representation_baseurl_node = find_child_node_by_name(representation_node, "BaseURL");
@@ -886,6 +894,37 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
         rep->id = av_strdup(val);
         xmlFree(val);
         if (!rep->id)
+            goto enomem;
+    }
+
+    val = xmlGetProp(representation_node, "cenc_decryption_key");
+    if (val) {
+        rep->cenc_decryption_key = av_strdup(val);
+        av_log(s, AV_LOG_INFO, "Setting key %s for %s\n", rep->cenc_decryption_key, rep->id);
+        xmlFree(val);
+        if (!rep->cenc_decryption_key)
+            goto enomem;
+    }
+    else
+    {
+        if (type == AVMEDIA_TYPE_VIDEO && c->cenc_decryption_video_key != NULL)
+        {
+            rep->cenc_decryption_key = av_strdup(c->cenc_decryption_video_key);
+            av_log(s, AV_LOG_INFO, "Setting video key %s for %s\n", rep->cenc_decryption_key, rep->id);
+        }
+        else if (type == AVMEDIA_TYPE_AUDIO && c->cenc_decryption_audio_key != NULL)
+        {
+            rep->cenc_decryption_key = av_strdup(c->cenc_decryption_audio_key);
+            av_log(s, AV_LOG_INFO, "Setting audio key %s for %s\n", rep->cenc_decryption_key, rep->id);
+        }
+    }
+
+    val = xmlGetProp(representation_node, "cenc_decryption_keys");
+    if (val) {
+        rep->cenc_decryption_keys = av_strdup(val);
+        av_log(s, AV_LOG_INFO, "Setting keys %s for %s\n", rep->cenc_decryption_keys, rep->id);
+        xmlFree(val);
+        if (!rep->cenc_decryption_keys)
             goto enomem;
     }
 
@@ -1900,9 +1939,14 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
     pls->ctx->pb = &pls->pb.pub;
     pls->ctx->io_open  = nested_io_open;
 
-    if (c->cenc_decryption_key)
+    if (pls->cenc_decryption_key)
+        av_dict_set(&in_fmt_opts, "decryption_key", pls->cenc_decryption_key, 0);
+    else if (c->cenc_decryption_key)
         av_dict_set(&in_fmt_opts, "decryption_key", c->cenc_decryption_key, 0);
-    if (c->cenc_decryption_keys)
+
+    if (pls->cenc_decryption_keys)
+        av_dict_set(&in_fmt_opts, "decryption_keys", pls->cenc_decryption_keys, 0);
+    else if (c->cenc_decryption_keys)
         av_dict_set(&in_fmt_opts, "decryption_keys", c->cenc_decryption_keys, 0);
 
     // provide additional information from mpd if available
@@ -2358,6 +2402,8 @@ static const AVOption dash_options[] = {
         INT_MIN, INT_MAX, FLAGS},
     { "cenc_decryption_key", "Media default decryption key (hex)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     {NULL}
 };
 
