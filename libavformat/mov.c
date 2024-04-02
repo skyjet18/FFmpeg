@@ -7151,6 +7151,7 @@ static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, AVEncryptionIn
     if (!c->decryption_keys) {
         av_assert0(c->decryption_default_key);
         memcpy(out, c->decryption_default_key, len);
+        av_log(c->fc, AV_LOG_DEBUG, "Returning default decryption key\n");
         return 0;
     }
 
@@ -7161,18 +7162,24 @@ static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, AVEncryptionIn
 
     ff_data_to_hex(kid_hex, sample->key_id, 16, 1);
     key_entry_hex = av_dict_get(c->decryption_keys, kid_hex, NULL, AV_DICT_DONT_STRDUP_KEY|AV_DICT_DONT_STRDUP_VAL);
+
     if (!key_entry_hex) {
         if (!c->decryption_default_key) {
             av_log(c->fc, AV_LOG_ERROR, "unable to find KID %s\n", kid_hex);
             return -1;
         }
         memcpy(out, c->decryption_default_key, len);
+        av_log(c->fc, AV_LOG_DEBUG, "Returning default decryption key\n");
         return 0;
     }
-    if (strlen(key_entry_hex->value) != len*2) {
+
+    size_t key_entry_len;
+    if (key_entry_len = strlen(key_entry_hex->value) != len*2) {
+        av_log(c->fc, AV_LOG_ERROR, "wrong key length: %lu\n", (long unsigned) key_entry_len);
         return -1;
     }
     ff_hex_to_data(out, key_entry_hex->value);
+    av_log(c->fc, AV_LOG_DEBUG, "Returning decryption key %s for kid %s\n", key_entry_hex->value, kid_hex);
     return 0;
 }
 
