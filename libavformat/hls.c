@@ -227,6 +227,8 @@ typedef struct HLSContext {
     char *allowed_segment_extensions;
     int extension_picky;
     int max_reload;
+    char *key_uri_replace_old;
+    char *key_uri_replace_new;
     int http_persistent;
     int http_multiple;
     int http_seekable;
@@ -1339,8 +1341,22 @@ static void intercept_id3(struct playlist *pls, uint8_t *buf,
 static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
 {
     AVIOContext *pb = NULL;
+    char *key_url = NULL;
 
-    int ret = open_url(pls->parent, &pb, seg->key, &c->avio_opts, NULL, NULL);
+    if (NULL != c->key_uri_replace_old && \
+        NULL != c-> key_uri_replace_new && \
+        '\0' != c->key_uri_replace_old[0]) {
+        key_url = av_strireplace(seg->key, c->key_uri_replace_old, c->key_uri_replace_new);
+    } else {
+        key_url = seg->key;
+    }
+
+    int ret = open_url(pls->parent, &pb, key_url, &c->avio_opts, NULL, NULL);
+
+    if (key_url != seg->key) {
+        av_free(key_url);
+    }
+
     if (ret < 0) {
         av_log(pls->parent, AV_LOG_ERROR, "Unable to open key file %s, %s\n",
                seg->key, av_err2str(ret));
@@ -2835,6 +2851,10 @@ static const AVOption hls_options[] = {
         OFFSET(extension_picky), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
         OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 100}, 0, INT_MAX, FLAGS},
+    {"key_uri_old", "allow to replace part of AES key uri - old",
+        OFFSET(key_uri_replace_old), AV_OPT_TYPE_STRING, { .str = "" }, 0, 0, FLAGS},
+    {"key_uri_new", "allow to replace part of AES key uri - new",
+        OFFSET(key_uri_replace_new), AV_OPT_TYPE_STRING, { .str = "" }, 0, 0, FLAGS},
     {"m3u8_hold_counters", "The maximum number of times to load m3u8 when it refreshes without new segments",
         OFFSET(m3u8_hold_counters), AV_OPT_TYPE_INT, {.i64 = 1000}, 0, INT_MAX, FLAGS},
     {"http_persistent", "Use persistent HTTP connections",
