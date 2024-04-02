@@ -223,6 +223,8 @@ typedef struct HLSContext {
     AVDictionary *seg_format_opts;
     char *allowed_extensions;
     int max_reload;
+    char *key_uri_replace_old;
+    char *key_uri_replace_new;
     int http_persistent;
     int http_multiple;
     int http_seekable;
@@ -1310,7 +1312,17 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
             else if (strncmp(seg->key, "keys://", 7) != 0) // "keys://" scheme contains multiple kid=key pairs and it will be handled later
             {
                 AVIOContext *pb = NULL;
-                if (open_url(pls->parent, &pb, seg->key, &c->avio_opts, opts, NULL) == 0) {
+                char *key_url = NULL;
+
+                if (NULL != c->key_uri_replace_old && \
+                    NULL != c-> key_uri_replace_new && \
+                    '\0' != c->key_uri_replace_old[0]) {
+                    key_url = av_strireplace(seg->key, c->key_uri_replace_old, c->key_uri_replace_new);
+                } else {
+                    key_url = seg->key;
+                }
+
+                if (open_url(pls->parent, &pb, key_url, &c->avio_opts, opts, NULL) == 0) {
                     ret = avio_read(pb, pls->key, sizeof(pls->key));
                     if (ret != sizeof(pls->key)) {
                         av_log(pls->parent, AV_LOG_ERROR, "Unable to read key file %s\n",
@@ -1320,6 +1332,10 @@ static int open_input(HLSContext *c, struct playlist *pls, struct segment *seg, 
                 } else {
                     av_log(pls->parent, AV_LOG_ERROR, "Unable to open key file %s\n",
                         seg->key);
+                }
+
+                if (key_url != seg->key) {
+                    av_free(key_url);
                 }
             }
             av_strlcpy(pls->key_url, seg->key, sizeof(pls->key_url));
@@ -2590,6 +2606,10 @@ static const AVOption hls_options[] = {
         INT_MIN, INT_MAX, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
         OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 3}, 0, INT_MAX, FLAGS},
+    {"key_uri_old", "allow to replace part of AES key uri - old",
+        OFFSET(key_uri_replace_old), AV_OPT_TYPE_STRING, { .str = "" }, 0, 0, FLAGS},
+    {"key_uri_new", "allow to replace part of AES key uri - new",
+        OFFSET(key_uri_replace_new), AV_OPT_TYPE_STRING, { .str = "" }, 0, 0, FLAGS},
     {"m3u8_hold_counters", "The maximum number of times to load m3u8 when it refreshes without new segments",
         OFFSET(m3u8_hold_counters), AV_OPT_TYPE_INT, {.i64 = 1000}, 0, INT_MAX, FLAGS},
     {"http_persistent", "Use persistent HTTP connections",
