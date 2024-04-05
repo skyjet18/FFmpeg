@@ -119,6 +119,9 @@ static int webvtt_read_header(AVFormatContext *s)
                 p++;
         }
 
+        if (strstr(p, "-->") == NULL)
+            continue;
+
         /* cue timestamps */
         if ((ts_start = read_ts(p)) == AV_NOPTS_VALUE)
             break;
