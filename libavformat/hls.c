@@ -2605,8 +2605,10 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     ts_diff = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
                                             tb.den, AV_ROUND_DOWN) -
                             pls->seek_timestamp;
-                    if (ts_diff >= 0 && (pls->seek_flags  & AVSEEK_FLAG_ANY ||
-                                        pls->pkt->flags & AV_PKT_FLAG_KEY)) {
+                    /* If AVSEEK_FLAG_ANY, keep reading until ts_diff is greater than 0
+                     * otherwise return the first keyframe encountered */
+                    if ((ts_diff >= 0 && (pls->seek_flags & AVSEEK_FLAG_ANY)) ||
+                        (!(pls->seek_flags & AVSEEK_FLAG_ANY) && (pls->pkt->flags & AV_PKT_FLAG_KEY)))  {
                         pls->seek_timestamp = AV_NOPTS_VALUE;
                         break;
                     }
