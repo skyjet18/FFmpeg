@@ -171,6 +171,8 @@ struct playlist {
      * playlist, if any. */
     int n_init_sections;
     struct segment **init_sections;
+
+    int is_subtitle; /* Indicates if it's a subtitle playlist */
 };
 
 /*
@@ -219,6 +221,7 @@ typedef struct HLSContext {
     int64_t cur_timestamp;
     AVIOInterruptCB *interrupt_callback;
     AVDictionary *avio_opts;
+    AVDictionary *demuxer_opts;
     AVDictionary *seg_format_opts;
     char *allowed_extensions;
     int max_reload;
@@ -227,6 +230,7 @@ typedef struct HLSContext {
     int http_persistent;
     int http_multiple;
     int http_seekable;
+    int seg_max_retry;
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
 } HLSContext;
@@ -328,6 +332,8 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
         return NULL;
     }
     pls->seek_timestamp = AV_NOPTS_VALUE;
+
+    pls->is_subtitle = 0;
 
     pls->is_id3_timestamped = -1;
     pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
@@ -513,13 +519,6 @@ static struct rendition *new_rendition(HLSContext *c, struct rendition_info *inf
         return NULL;
     }
 
-    /* TODO: handle subtitles (each segment has to parsed separately) */
-    if (c->ctx->strict_std_compliance > FF_COMPLIANCE_EXPERIMENTAL)
-        if (type == AVMEDIA_TYPE_SUBTITLE) {
-            av_log(c->ctx, AV_LOG_WARNING, "Can't support the subtitle(uri: %s)\n", info->uri);
-            return NULL;
-        }
-
     rend = av_mallocz(sizeof(struct rendition));
     if (!rend)
         return NULL;
@@ -534,9 +533,14 @@ static struct rendition *new_rendition(HLSContext *c, struct rendition_info *inf
     /* add the playlist if this is an external rendition */
     if (info->uri[0]) {
         rend->playlist = new_playlist(c, info->uri, url_base);
-        if (rend->playlist)
+        if (rend->playlist) {
             dynarray_add(&rend->playlist->renditions,
                          &rend->playlist->n_renditions, rend);
+            if (type == AVMEDIA_TYPE_SUBTITLE) {
+                rend->playlist->is_subtitle = 1;
+                rend->playlist->is_id3_timestamped = 0;
+            }
+        }
     }
 
     if (info->assoc_language[0]) {
@@ -1496,16 +1500,11 @@ static int playlist_needed(struct playlist *pls)
     return 0;
 }
 
-static int read_data(void *opaque, uint8_t *buf, int buf_size)
+static int reload_playlist(struct playlist *v, HLSContext *c)
 {
-    struct playlist *v = opaque;
-    HLSContext *c = v->parent->priv_data;
-    int ret;
-    int just_opened = 0;
+    int ret = 0;
     int reload_count = 0;
-    struct segment *seg;
 
-restart:
     if (!v->needed)
         return AVERROR_EOF;
 
@@ -1514,7 +1513,7 @@ restart:
 
         /* Check that the playlist is still needed before opening a new
          * segment. */
-        v->needed = playlist_needed(v);
+        v->needed = playlist_needed(v) || v->is_subtitle;
 
         if (!v->needed) {
             av_log(v->parent, AV_LOG_INFO, "No longer receiving playlist %d ('%s')\n",
@@ -1561,7 +1560,7 @@ reload:
             av_log(v->parent, AV_LOG_WARNING, "maybe the m3u8 list sequence have been wraped.\n");
         }
         if (v->cur_seq_no >= v->start_seq_no + v->n_segments) {
-            if (v->finished)
+            if (v->finished || v->is_subtitle)
                 return AVERROR_EOF;
             while (av_gettime_relative() - v->last_load_time < reload_interval) {
                 if (ff_check_interrupt(c->interrupt_callback))
@@ -1571,13 +1570,33 @@ reload:
             /* Enough time has elapsed since the last reload */
             goto reload;
         }
+    }
 
+    return ret;
+}
+
+static int read_data_continuous(void *opaque, uint8_t *buf, int buf_size)
+{
+    struct playlist *v = opaque;
+    HLSContext *c = v->parent->priv_data;
+    int ret;
+    int just_opened = 0;
+    int segment_retries = 0;
+    struct segment *seg;
+
+restart:
+    ret = reload_playlist(v, c);
+    if (ret < 0)
+        return ret;
+
+    if (!v->input || (c->http_persistent && v->input_read_done)) {
+//    if (!v->input) {
         v->input_read_done = 0;
         seg = current_segment(v);
 
         /* load/update Media Initialization Section, if any */
         ret = update_init_section(v, seg);
-        if (ret)
+        if (ret < 0)
             return ret;
 
         if (c->http_multiple == 1 && v->input_next_requested) {
@@ -1594,8 +1613,16 @@ reload:
             av_log(v->parent, AV_LOG_WARNING, "Failed to open segment %"PRId64" of playlist %d\n",
                    v->cur_seq_no,
                    v->index);
-            v->cur_seq_no += 1;
-            goto reload;
+            if (segment_retries >= c->seg_max_retry) {
+                av_log(v->parent, AV_LOG_WARNING, "Segment %"PRId64" of playlist %d failed too many times, skipping\n",
+                       v->cur_seq_no,
+                       v->index);
+                v->cur_seq_no++;
+                segment_retries = 0;
+            } else {
+                segment_retries++;
+            }
+            goto restart;
         }
         just_opened = 1;
     }
@@ -1650,8 +1677,108 @@ reload:
         ff_format_io_close(v->parent, &v->input);
     }
     v->cur_seq_no++;
-
     c->cur_seq_no = v->cur_seq_no;
+
+    goto restart;
+}
+
+static int read_data_subtitle_segment(void *opaque, uint8_t *buf, int buf_size)
+{
+    struct playlist *v = opaque;
+    HLSContext *c = v->parent->priv_data;
+    int ret;
+    struct segment *seg;
+
+    if (!v->needed || v->cur_seq_no - v->start_seq_no >= v->n_segments) {
+        return AVERROR_EOF;
+    } else {
+        seg = current_segment(v);
+    }
+
+    if (!v->input) {
+        ret = open_input(c, v, seg, &v->input);
+        if (ret < 0) {
+            if (ff_check_interrupt(c->interrupt_callback))
+                return AVERROR_EXIT;
+            av_log(v->parent, AV_LOG_WARNING, "Failed to open segment of playlist %d\n",
+                   v->index);
+            return ret;
+        }
+    }
+
+    return read_from_url(v, seg, buf, buf_size);
+}
+
+static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
+                          int flags, AVDictionary **opts)
+{
+    av_log(s, AV_LOG_ERROR,
+           "A HLS playlist item '%s' referred to an external file '%s'. "
+           "Opening this file was forbidden for security reasons\n",
+           s->url, url);
+    return AVERROR(EPERM);
+}
+
+static int init_subtitle_context(struct playlist *pls)
+{
+    HLSContext *c = pls->parent->priv_data;
+    const AVInputFormat *in_fmt;
+    AVDictionary *opts = NULL;
+    int ret = 0;
+
+    if (!(pls->ctx = avformat_alloc_context()))
+        return AVERROR(ENOMEM);
+
+    pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
+    if (!pls->read_buffer) {
+        avformat_free_context(pls->ctx);
+        pls->ctx = NULL;
+        return AVERROR(ENOMEM);
+    }
+
+    ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                      read_data_subtitle_segment, NULL, NULL);
+    pls->pb.pub.seekable = 0;
+    pls->ctx->pb = &pls->pb.pub;
+    pls->ctx->io_open = nested_io_open;
+
+    ret = ff_copy_whiteblacklists(pls->ctx, pls->parent);
+    if (ret < 0)
+        return ret;
+
+    in_fmt = av_find_input_format("webvtt");
+    av_dict_copy(&opts, c->demuxer_opts, 0);
+    ret = avformat_open_input(&pls->ctx, current_segment(pls)->url, in_fmt, &opts);
+    av_dict_free(&opts);
+
+    return ret;
+}
+
+static int read_subtitle_packet(struct playlist *v, AVPacket *pkt)
+{
+    HLSContext *c = v->parent->priv_data;
+    int ret;
+
+restart:
+    ret = reload_playlist(v, c);
+    if (ret < 0)
+        return ret;
+
+    if (!v->input && !v->ctx) {
+        ret = init_subtitle_context(v);
+        if (ret < 0)
+            return ret;
+    }
+
+    ret = av_read_frame(v->ctx, v->pkt);
+    if (!ret) {
+        return ret;
+    }
+    ff_format_io_close(v->parent, &v->input);
+    v->cur_seq_no++;
+    c->cur_seq_no = v->cur_seq_no;
+
+    avformat_close_input(&v->ctx);
 
     goto restart;
 }
@@ -1817,16 +1944,6 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
     return pls->start_seq_no;
 }
 
-static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
-                          int flags, AVDictionary **opts)
-{
-    av_log(s, AV_LOG_ERROR,
-           "A HLS playlist item '%s' referred to an external file '%s'. "
-           "Opening this file was forbidden for security reasons\n",
-           s->url, url);
-    return AVERROR(EPERM);
-}
-
 static void add_stream_to_programs(AVFormatContext *s, struct playlist *pls, AVStream *stream)
 {
     HLSContext *c = s->priv_data;
@@ -1944,6 +2061,7 @@ static int hls_close(AVFormatContext *s)
         av_free(c->crypto_ctx.aes_ctx);
 
     av_dict_free(&c->avio_opts);
+    av_dict_free(&c->demuxer_opts);
     ff_format_io_close(c->ctx, &c->playlist_pb);
 
     return 0;
@@ -2043,6 +2161,8 @@ static int hls_read_header(AVFormatContext *s)
         highest_cur_seq_no = FFMAX(highest_cur_seq_no, pls->cur_seq_no);
     }
 
+    av_dict_set(&c->demuxer_opts, "prefer_hls_mpegts_pts", "1", 0);
+
     /* Open the demuxer for each playlist */
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
@@ -2080,8 +2200,12 @@ static int hls_read_header(AVFormatContext *s)
             return AVERROR(ENOMEM);
         }
 
-        ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
-                          read_data, NULL, NULL);
+        if (pls->is_subtitle)
+            ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                                      read_data_subtitle_segment, NULL, NULL);
+        else
+            ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                                      read_data_continuous, NULL, NULL);
 
         /*
          * If encryption scheme is SAMPLE-AES, try to read  ID3 tags of
@@ -2178,6 +2302,7 @@ static int hls_read_header(AVFormatContext *s)
             return ret;
 
         av_dict_copy(&options, c->seg_format_opts, 0);
+        av_dict_copy(&options, c->demuxer_opts, 0);
 
         ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, &options);
         av_dict_free(&options);
@@ -2264,6 +2389,9 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             av_log(s, AV_LOG_INFO, "Now receiving playlist %d, segment %"PRId64"\n", i, pls->cur_seq_no);
         } else if (first && !cur_needed && pls->needed) {
             ff_format_io_close(pls->parent, &pls->input);
+            if (pls->is_subtitle)
+                avformat_close_input(&pls->ctx);
+
             pls->input_read_done = 0;
             ff_format_io_close(pls->parent, &pls->input_next);
             pls->input_next_requested = 0;
@@ -2334,7 +2462,11 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                 int64_t ts_diff;
                 AVRational tb;
                 struct segment *seg = NULL;
-                ret = av_read_frame(pls->ctx, pls->pkt);
+                if (pls->is_subtitle)
+                    ret = read_subtitle_packet(pls, pls->pkt);
+                else
+                    ret = av_read_frame(pls->ctx, pls->pkt);
+
                 if (ret < 0) {
                     if (!avio_feof(&pls->pb.pub) && ret != AVERROR_EOF)
                         return ret;
@@ -2532,7 +2664,14 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Reset the pos, to let the mpegts/mov demuxer know we've seeked. */
         pb->pos = 0;
         /* Flush the packet queue of the subdemuxer. */
-        ff_read_frame_flush(pls->ctx);
+        if (pls->ctx)
+            ff_read_frame_flush(pls->ctx);
+
+        if (pls->is_subtitle)
+            avformat_close_input(&pls->ctx);
+
+        /* Reset the init segment so it's re-fetched and served appropiately */
+        pls->cur_init_section = NULL;
 
         pls->seek_timestamp = seek_timestamp;
         pls->seek_flags = flags;
@@ -2594,6 +2733,8 @@ static const AVOption hls_options[] = {
         OFFSET(http_seekable), AV_OPT_TYPE_BOOL, { .i64 = -1}, -1, 1, FLAGS},
     {"seg_format_options", "Set options for segment demuxer",
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
+    {"seg_max_retry", "Maximum number of times to reload a segment on error.",
+        OFFSET(seg_max_retry), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, FLAGS},
     {NULL}
 };
 
