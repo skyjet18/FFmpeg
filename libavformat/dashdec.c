@@ -1607,6 +1607,23 @@ static int refresh_manifest(AVFormatContext *s)
         }
     }
 
+    for (i = 0; i < n_subtitles; i++) {
+        struct representation *cur_subtitle = subtitles[i];
+        struct representation *ccur_subtitle = c->subtitles[i];
+        if (cur_subtitle->timelines) {
+            // calc current time
+            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_subtitle, cur_subtitle->cur_seq_no) / cur_subtitle->fragment_timescale;
+            // update segments
+            ccur_subtitle->cur_seq_no = calc_next_seg_no_from_timelines(ccur_subtitle, currentTime * cur_subtitle->fragment_timescale - 1);
+            if (ccur_subtitle->cur_seq_no >= 0) {
+                move_timelines(ccur_subtitle, cur_subtitle, c);
+            }
+        }
+        if (cur_subtitle->fragments) {
+            move_segments(ccur_subtitle, cur_subtitle, c);
+        }
+    }
+
 finish:
     // restore context
     if (c->base_url)
