@@ -165,6 +165,7 @@ typedef struct DASHContext {
     int is_init_section_common_audio;
     int is_init_section_common_subtitle;
 
+    uint64_t playlist_load_time;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -1281,6 +1282,7 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
         if (ret == 0)
             ret = AVERROR_INVALIDDATA;
     } else {
+        c->playlist_load_time = get_current_time_in_sec();
         LIBXML_TEST_VERSION
 
         doc = xmlReadMemory(buf.str, buf.len, c->base_url, NULL, 0);
@@ -1534,6 +1536,15 @@ static int refresh_manifest(AVFormatContext *s)
     int n_subtitles = c->n_subtitles;
     struct representation **subtitles = c->subtitles;
     char *base_url = c->base_url;
+
+    uint64_t cur_time = get_current_time_in_sec();
+//    uint64_t publish_time = c->publish_time > 0 ? c->publish_time : c->playlist_load_time;
+    uint64_t publish_time = c->playlist_load_time;
+
+    if ( publish_time > 0 && (publish_time + c->minimum_update_period) >= cur_time) {
+        av_log(s, AV_LOG_TRACE, "Manifest refresh not needed - current one is still %llus valid\n", (publish_time + c->minimum_update_period) - cur_time);
+        return 0;
+    }
 
     c->base_url = NULL;
     c->n_videos = 0;
