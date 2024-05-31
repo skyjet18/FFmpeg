@@ -1655,6 +1655,7 @@ static struct fragment *get_current_fragment(struct representation *pls)
     struct fragment *seg_ptr = NULL;
     DASHContext *c = pls->parent->priv_data;
 
+try_again:
     while (( !ff_check_interrupt(c->interrupt_callback)&& pls->n_fragments > 0)) {
         if (pls->cur_seq_no < pls->n_fragments) {
             seg_ptr = pls->fragments[pls->cur_seq_no];
@@ -1687,7 +1688,13 @@ static struct fragment *get_current_fragment(struct representation *pls)
             av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
             pls->cur_seq_no = calc_cur_seg_no(pls->parent, pls);
         } else if (pls->cur_seq_no > max_seq_no) {
-            av_log(pls->parent, AV_LOG_VERBOSE, "new fragment: min[%"PRId64"] max[%"PRId64"]\n", min_seq_no, max_seq_no);
+            av_log(pls->parent, AV_LOG_VERBOSE, "new fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
+
+            /* we are reading data too fast - wait and try again later, because we will get HTTP 404 ...*/
+            av_usleep(100*1000);
+            goto try_again;
+        } else {
+            av_log(pls->parent, AV_LOG_VERBOSE, "cur fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
         }
         seg = av_mallocz(sizeof(struct fragment));
         if (!seg) {
