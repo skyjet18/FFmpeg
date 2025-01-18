@@ -37,6 +37,7 @@ typedef struct {
     FFDemuxSubtitlesQueue q;
     int kind;
     int prefer_hls_mpegts_pts;
+    int fake_last_subtitle;
 } WebVTTContext;
 
 static int webvtt_probe(const AVProbeData *p)
@@ -72,7 +73,8 @@ static int webvtt_read_header(AVFormatContext *s)
     AVStream *st = avformat_new_stream(s, NULL);
     int has_hls_timestamp_map = 0;
     int64_t hls_ts_offset;
-
+    int64_t pos = 0;
+    AVPacket *sub;
 
     if (!st)
         return AVERROR(ENOMEM);
@@ -85,8 +87,7 @@ static int webvtt_read_header(AVFormatContext *s)
 
     for (;;) {
         int i;
-        int64_t pos;
-        AVPacket *sub;
+
         const char *p, *identifier, *settings;
         size_t identifier_len, settings_len;
         int64_t ts_start, ts_end;
@@ -210,6 +211,19 @@ static int webvtt_read_header(AVFormatContext *s)
         SET_SIDE_DATA(settings,   AV_PKT_DATA_WEBVTT_SETTINGS);
     }
 
+    if( webvtt->fake_last_subtitle )
+    {
+        /* insert fake end packet to prevent EOF before video/audio stream ends */
+        sub = ff_subtitles_queue_insert(&webvtt->q, "", 0, 0);
+        if (!sub) {
+            res = AVERROR(ENOMEM);
+            goto end;
+        }
+        sub->pos = pos + INT64_C(1);
+        sub->pts = INT64_MAX - INT64_C(2);
+        sub->duration = INT64_C(1);
+    }
+
     ff_subtitles_queue_finalize(s, &webvtt->q);
 
 end:
@@ -248,6 +262,7 @@ static const AVOption options[] = {
         { "descriptions", "WebVTT descriptions kind", 0, AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_DESCRIPTIONS }, INT_MIN, INT_MAX, KIND_FLAGS, .unit = "webvtt_kind" },
         { "metadata",     "WebVTT metadata kind",     0, AV_OPT_TYPE_CONST, { .i64 = AV_DISPOSITION_METADATA },     INT_MIN, INT_MAX, KIND_FLAGS, .unit = "webvtt_kind" },
         { "prefer_hls_mpegts_pts", "Use WebVTT embedded HLS MPEGTS timestamps if available.", OFFSET(prefer_hls_mpegts_pts), AV_OPT_TYPE_INT, { .i64 = 1 }, 0, 1, KIND_FLAGS, .unit = "webvtt_kind" },
+        { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, KIND_FLAGS },
     { NULL }
 };
 
