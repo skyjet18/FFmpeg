@@ -37,6 +37,7 @@
 struct fragment {
     int64_t url_offset;
     int64_t size;
+    int seekable;
     char *url;
 };
 
@@ -121,6 +122,7 @@ struct representation {
 
     char *cenc_decryption_key;
     char *cenc_decryption_keys;
+    enum AVMediaType type;
 };
 
 typedef struct DASHContext {
@@ -167,6 +169,7 @@ typedef struct DASHContext {
     int is_init_section_common_subtitle;
 
     uint64_t playlist_load_time;
+    int fake_last_subtitle;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -898,6 +901,7 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
     }
 
     rep->parent = s;
+    rep->type = type;
     representation_segmenttemplate_node = find_child_node_by_name(representation_node, "SegmentTemplate");
     representation_baseurl_node = find_child_node_by_name(representation_node, "BaseURL");
     representation_segmentlist_node = find_child_node_by_name(representation_node, "SegmentList");
@@ -1056,6 +1060,7 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
         if (!seg->url)
             goto enomem;
         seg->size = -1;
+        seg->seekable = 1;
     } else if (representation_segmentlist_node) {
         // TODO: https://www.brendanlong.com/the-structure-of-an-mpeg-dash-mpd.html
         // http://www-itec.uni-klu.ac.at/dash/ddash/mpdGenerator.php?fragmentlength=15&type=full
@@ -1689,9 +1694,11 @@ try_again:
             }
             seg->size = seg_ptr->size;
             seg->url_offset = seg_ptr->url_offset;
+            seg->seekable = seg_ptr->seekable;
             return seg;
         } else if (c->is_live) {
             refresh_manifest(pls->parent);
+            pls->parent->duration = (int64_t) c->time_shift_buffer_depth * AV_TIME_BASE;
         } else {
             break;
         }
@@ -1702,6 +1709,7 @@ try_again:
 
         if (pls->timelines || pls->fragments) {
             refresh_manifest(pls->parent);
+            pls->parent->duration = (int64_t) c->time_shift_buffer_depth * AV_TIME_BASE;
         }
         if (pls->cur_seq_no <= min_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
@@ -1789,6 +1797,15 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
          * (if this is in fact a HTTP request) */
         av_dict_set_int(&opts, "offset", seg->url_offset, 0);
         av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
+    }
+
+    if(seg->seekable && pls->type != AVMEDIA_TYPE_SUBTITLE)
+    {
+        av_dict_set(&opts, "seekable", "1", 0);
+    }
+    else
+    {
+        av_dict_set(&opts, "seekable", "0", 0);
     }
 
     ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
@@ -1972,8 +1989,16 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
         goto fail;
     }
     ffio_init_context(&pls->pb, avio_ctx_buffer, INITIAL_BUFFER_SIZE, 0,
-                      pls, read_data, NULL, c->is_live ? NULL : seek_data);
-    pls->pb.pub.seekable = 0;
+                      pls, read_data, NULL, seek_data);
+
+    if(pls->type == AVMEDIA_TYPE_SUBTITLE || pls->n_timelines || pls->n_fragments > 1)
+    {
+        pls->pb.pub.seekable = 0;
+    }
+    else
+    {
+        pls->pb.pub.seekable = AVIO_SEEKABLE_NORMAL;
+    }
 
     if ((ret = ff_copy_whiteblacklists(pls->ctx, s)) < 0)
         goto fail;
@@ -2002,6 +2027,11 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
         av_dict_set(&in_fmt_opts, "decryption_keys", pls->cenc_decryption_keys, 0);
     else if (c->cenc_decryption_keys)
         av_dict_set(&in_fmt_opts, "decryption_keys", c->cenc_decryption_keys, 0);
+
+    if(pls->type == AVMEDIA_TYPE_SUBTITLE && c->fake_last_subtitle)
+    {
+        av_dict_set(&in_fmt_opts, "fake_last_subtitle", "1", 0);
+    }
 
     // provide additional information from mpd if available
     ret = avformat_open_input(&pls->ctx, "", in_fmt, &in_fmt_opts); //pls->init_section->url
@@ -2131,8 +2161,6 @@ static int dash_read_header(AVFormatContext *s)
      * stream. */
     if (!c->is_live) {
         s->duration = (int64_t) c->media_presentation_duration * AV_TIME_BASE;
-    } else {
-        av_dict_set(&c->avio_opts, "seekable", "0", 0);
     }
 
     if(c->n_videos)
@@ -2400,6 +2428,11 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
     if ((flags & AVSEEK_FLAG_BYTE) || c->is_live)
         return AVERROR(ENOSYS);
 
+    if (c->is_live && c->time_shift_buffer_depth <=0)
+    {
+        return AVERROR(ENOSYS);
+    }
+
     /* Seek in discarded streams with dry_run=1 to avoid reopening them */
     for (i = 0; i < c->n_videos; i++) {
         if (!ret)
@@ -2447,6 +2480,7 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     {NULL}
 };
 
