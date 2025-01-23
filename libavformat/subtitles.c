@@ -273,12 +273,27 @@ int ff_subtitles_queue_seek(FFDemuxSubtitlesQueue *q, AVFormatContext *s, int st
 
         if (idx < 0)
             return idx;
-        for (i = idx; i < q->nb_subs && q->subs[i]->pts < min_ts; i++)
+        for (i = idx; i < q->nb_subs; i++)
+        {
             if (stream_index == -1 || q->subs[i]->stream_index == stream_index)
                 idx = i;
-        for (i = idx; i > 0 && q->subs[i]->pts > max_ts; i--)
+
+            if(q->subs[i]->pts >= min_ts)
+            {
+                break;
+            }
+        }
+
+        for (i = idx; i > 0; i--)
+        {
             if (stream_index == -1 || q->subs[i]->stream_index == stream_index)
                 idx = i;
+
+            if(q->subs[i]->pts <= max_ts)
+            {
+                break;
+            }
+        }
 
         ts_selected = q->subs[idx]->pts;
         if (ts_selected < min_ts || ts_selected > max_ts)
