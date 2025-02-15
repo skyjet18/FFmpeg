@@ -1831,13 +1831,22 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
         av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
     }
 
-    if(seg->seekable && pls->type != AVMEDIA_TYPE_SUBTITLE)
+    if( pls->type == AVMEDIA_TYPE_SUBTITLE )
     {
+        /* disable seeking for subtitles - subtitles are small and many servers doesn't support byterange for subtitles */
+        av_dict_set(&opts, "seekable", "0", 0);
+    }
+    else if(seg->seekable)
+    {
+        /* single big segment - allow seeking and reconnect if needed */
         av_dict_set(&opts, "seekable", "1", 0);
+        av_dict_set(&opts, "reconnect", "1", 0);
     }
     else
     {
+        /* many smaller segments - disable seeking and allow keep-alive connection */
         av_dict_set(&opts, "seekable", "0", 0);
+        av_dict_set(&opts, "multiple_requests", "1", 0);
     }
 
     ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
