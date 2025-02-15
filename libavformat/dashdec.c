@@ -1603,8 +1603,18 @@ static int refresh_manifest(AVFormatContext *s)
         if (cur_video->timelines) {
             // calc current time
             int64_t currentTime = get_segment_start_time_based_on_timeline(cur_video, cur_video->cur_seq_no) / cur_video->fragment_timescale;
+            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_video, currentTime * cur_video->fragment_timescale - 1) + cur_video->first_seq_no;
+
             // update segments
-            ccur_video->cur_seq_no = calc_next_seg_no_from_timelines(ccur_video, currentTime * cur_video->fragment_timescale - 1);
+            if( cur_video->cur_seq_no > next_seg_no || cur_video->cur_seq_no < calc_min_seg_no(s, ccur_video) )
+            {
+                ccur_video->cur_seq_no = next_seg_no;
+            }
+            else
+            {
+                ccur_video->cur_seq_no = cur_video->cur_seq_no;
+            }
+
             if (ccur_video->cur_seq_no >= 0) {
                 move_timelines(ccur_video, cur_video, c);
             }
@@ -1619,8 +1629,18 @@ static int refresh_manifest(AVFormatContext *s)
         if (cur_audio->timelines) {
             // calc current time
             int64_t currentTime = get_segment_start_time_based_on_timeline(cur_audio, cur_audio->cur_seq_no) / cur_audio->fragment_timescale;
+            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_audio, currentTime * cur_audio->fragment_timescale - 1) + cur_audio->first_seq_no;
+
             // update segments
-            ccur_audio->cur_seq_no = calc_next_seg_no_from_timelines(ccur_audio, currentTime * cur_audio->fragment_timescale - 1);
+            if( cur_audio->cur_seq_no > next_seg_no || cur_audio->cur_seq_no < calc_min_seg_no(s, ccur_audio))
+            {
+                ccur_audio->cur_seq_no = next_seg_no;
+            }
+            else
+            {
+                ccur_audio->cur_seq_no = cur_audio->cur_seq_no;
+            }
+
             if (ccur_audio->cur_seq_no >= 0) {
                 move_timelines(ccur_audio, cur_audio, c);
             }
@@ -1636,8 +1656,18 @@ static int refresh_manifest(AVFormatContext *s)
         if (cur_subtitle->timelines) {
             // calc current time
             int64_t currentTime = get_segment_start_time_based_on_timeline(cur_subtitle, cur_subtitle->cur_seq_no) / cur_subtitle->fragment_timescale;
+            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_subtitle, currentTime * cur_subtitle->fragment_timescale - 1) + cur_subtitle->first_seq_no;
+
             // update segments
-            ccur_subtitle->cur_seq_no = calc_next_seg_no_from_timelines(ccur_subtitle, currentTime * cur_subtitle->fragment_timescale - 1);
+            if( cur_subtitle->cur_seq_no > next_seg_no || cur_subtitle->cur_seq_no < calc_min_seg_no(s, ccur_subtitle))
+            {
+                ccur_subtitle->cur_seq_no = next_seg_no;
+            }
+            else
+            {
+                ccur_subtitle->cur_seq_no = cur_subtitle->cur_seq_no;
+            }
+
             if (ccur_subtitle->cur_seq_no >= 0) {
                 move_timelines(ccur_subtitle, cur_subtitle, c);
             }
