@@ -1743,7 +1743,7 @@ try_again:
             refresh_manifest(pls->parent);
             pls->parent->duration = (int64_t) c->time_shift_buffer_depth * AV_TIME_BASE;
         }
-        if (pls->cur_seq_no <= min_seq_no) {
+        if (pls->cur_seq_no < min_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
             pls->cur_seq_no = calc_cur_seg_no(pls->parent, pls);
         } else if (pls->cur_seq_no > max_seq_no) {
