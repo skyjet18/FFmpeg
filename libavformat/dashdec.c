@@ -2442,13 +2442,13 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
                 duration = pls->timelines[i]->starttime;
             }
             duration += pls->timelines[i]->duration;
-            if (seek_pos_msec < ((duration * 1000) /  pls->fragment_timescale)) {
+            if (seek_pos_msec < ((duration / pls->fragment_timescale) * 1000) ) {
                 goto set_seq_num;
             }
             for (j = 0; j < pls->timelines[i]->repeat; j++) {
                 duration += pls->timelines[i]->duration;
                 num++;
-                if (seek_pos_msec < ((duration * 1000) /  pls->fragment_timescale)) {
+                if (seek_pos_msec < ((duration / pls->fragment_timescale) * 1000) ) {
                     goto set_seq_num;
                 }
             }
