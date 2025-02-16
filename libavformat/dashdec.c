@@ -2418,6 +2418,7 @@ static int dash_close(AVFormatContext *s)
 
 static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t seek_pos_msec, int flags, int dry_run)
 {
+    DASHContext *c = s->priv_data;
     int ret = 0;
     int i = 0;
     int j = 0;
@@ -2442,6 +2443,18 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
     if (pls->n_timelines > 0 && pls->fragment_timescale > 0) {
         int64_t num = pls->first_seq_no;
         seek_pos_msec += (pls->first_pts / pls->fragment_timescale) * 1000;
+
+        if(c->is_live)
+        {
+            /* don't allow to jump after last available segment */
+            int64_t seek_limit = (get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF) / pls->fragment_timescale) - (2 * c->min_buffer_time);
+            seek_limit *= 1000;
+
+            if( seek_limit < seek_pos_msec )
+            {
+                seek_pos_msec = seek_limit;
+            }
+        }
 
         av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline start n_timelines[%d] "
                "last_seq_no[%"PRId64"].\n",
