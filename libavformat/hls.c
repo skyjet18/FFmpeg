@@ -316,6 +316,20 @@ static void free_rendition_list(HLSContext *c)
     c->n_renditions = 0;
 }
 
+static void update_duration(AVFormatContext *s)
+{
+    HLSContext *c = s->priv_data;
+    int i;
+
+     /* If this isn't a live stream, calculate the total duration of the stream. */
+    if (c->n_variants > 0 && (c->variants[0]->playlists[0]->finished || c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT)) {
+        int64_t duration = 0;
+        for (i = 0; i < c->variants[0]->playlists[0]->n_segments; i++)
+            duration += c->variants[0]->playlists[0]->segments[i]->duration;
+        s->duration = duration;
+    }
+}
+
 static struct playlist *new_playlist(HLSContext *c, const char *url,
                                      const char *base)
 {
@@ -1105,6 +1119,8 @@ fail:
         !(c->variants[0]->playlists[0]->finished ||
           c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT))
         c->ctx->ctx_flags |= AVFMTCTX_UNSEEKABLE;
+
+    update_duration(c->ctx);
     return ret;
 }
 
@@ -1983,12 +1999,12 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
     /* If playback is already in progress (we are just selecting a new
      * playlist) and this is a complete file, find the matching segment
      * by counting durations. */
-    if (pls->finished && c->cur_timestamp != AV_NOPTS_VALUE) {
+    if ((pls->finished || pls->type == PLS_TYPE_EVENT) && c->cur_timestamp != AV_NOPTS_VALUE) {
         find_timestamp_in_playlist(c, pls, c->cur_timestamp, &seq_no, NULL);
         return seq_no;
     }
 
-    if (!pls->finished) {
+    if (!pls->finished && pls->type != PLS_TYPE_EVENT) {
         if (!c->first_packet && /* we are doing a segment selection during playback */
             c->cur_seq_no >= pls->start_seq_no &&
             c->cur_seq_no < pls->start_seq_no + pls->n_segments)
@@ -2208,15 +2224,6 @@ static int hls_read_header(AVFormatContext *s)
             av_log(s, AV_LOG_WARNING, "Empty segment [%s]\n", c->variants[i]->playlists[0]->url);
             c->variants[i]->playlists[0]->broken = 1;
         }
-    }
-
-    /* If this isn't a live stream, calculate the total duration of the
-     * stream. */
-    if (c->variants[0]->playlists[0]->finished) {
-        int64_t duration = 0;
-        for (i = 0; i < c->variants[0]->playlists[0]->n_segments; i++)
-            duration += c->variants[0]->playlists[0]->segments[i]->duration;
-        s->duration = duration;
     }
 
     /* Associate renditions with variants */
