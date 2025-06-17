@@ -1791,6 +1791,13 @@ int ifile_open(const OptionsContext *o, const char *filename, Scheduler *sch)
         av_dict_set(&o->g->format_opts, "scan_all_pmts", "1", AV_DICT_DONT_OVERWRITE);
         scan_all_pmts_set = 1;
     }
+
+    if( strncmp(filename, "http://127.0.0.1", 16) == 0 )
+    {
+        /* when using with ArchivCZSK, then indicate DRM support */
+        av_dict_set(&o->g->format_opts, "headers", "X-DRM-Api-Level: 1\r\n", AV_DICT_APPEND);
+    }
+
     /* open the input file with generic avformat function */
     err = avformat_open_input(&ic, filename, file_iformat, &o->g->format_opts);
     if (err < 0) {
