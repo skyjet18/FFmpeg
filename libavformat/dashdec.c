@@ -906,7 +906,7 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
 
     rep->parent = s;
     rep->type = type;
-    rep->first_pts = INT64_MIN;
+    rep->first_pts = type == AVMEDIA_TYPE_SUBTITLE ? INT64_C(0) : INT64_MIN; // PTS correction is needed only for non subtitle stream
     representation_segmenttemplate_node = find_child_node_by_name(representation_node, "SegmentTemplate");
     representation_baseurl_node = find_child_node_by_name(representation_node, "BaseURL");
     representation_segmentlist_node = find_child_node_by_name(representation_node, "SegmentList");
