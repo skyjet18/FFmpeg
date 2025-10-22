@@ -1858,7 +1858,7 @@ restart:
     if (v->input && !v->ctx)
         ff_format_io_close(v->parent, &v->input);
 
-    if (!v->input && !v->ctx) {
+    if (!v->ctx) {
         ret = init_subtitle_context(v);
         if (ret < 0)
             return ret;
