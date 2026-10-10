@@ -171,6 +171,15 @@ typedef struct DASHContext {
 
     uint64_t playlist_load_time;
     int fake_last_subtitle;
+
+    /* Common start position for live SegmentTimeline streams, in
+     * AV_TIME_BASE units; AV_NOPTS_VALUE until it has been computed. */
+    int64_t live_start_time;
+    /* Media time subtracted from the timestamps of every representation,
+     * in AV_TIME_BASE units; AV_NOPTS_VALUE until the first packet. */
+    int64_t first_pts_time;
+    /* Option: distance to the live edge in seconds, 0 = automatic */
+    int live_delay;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -1444,6 +1453,64 @@ cleanup:
     return ret;
 }
 
+static int64_t timeline_end_time(struct representation *pls)
+{
+    if (!pls->n_timelines || pls->fragment_timescale <= 0)
+        return INT64_MAX;
+    /* with a seq_no past the last segment this returns the end of the timeline */
+    return av_rescale(get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF),
+                      AV_TIME_BASE, pls->fragment_timescale);
+}
+
+/*
+ * Distance to the live edge in seconds. Twice minBufferTime is not enough
+ * for every packager: with minBufferTime="PT2S" (Sky) it leaves two to four
+ * seconds, while 1.92 s segments are published in bursts up to 3.4 s apart.
+ * The player then keeps catching up with the edge and the picture stalls.
+ * Use at least suggestedPresentationDelay and LIVE_DELAY_MIN seconds; the
+ * live_delay option overrides all of it.
+ */
+#define LIVE_DELAY_MIN 12
+
+static int64_t live_delay(DASHContext *c)
+{
+    int64_t delay;
+
+    if (c->live_delay > 0)
+        return c->live_delay;
+    delay = c->min_buffer_time > 0 ? 2 * c->min_buffer_time : 60;
+    delay = FFMAX(delay, (int64_t)c->suggested_presentation_delay);
+    return FFMAX(delay, LIVE_DELAY_MIN);
+}
+
+/*
+ * All representations of a live stream have to start at the same media time.
+ * Packagers do not publish all AdaptationSets at the same moment; the video
+ * timeline can end a whole segment later than the audio timeline. Computing
+ * the start from each representation's own edge then makes audio and video
+ * start one segment apart, and because the manifest is refreshed while the
+ * first representation is opened, later representations may even be
+ * positioned against a newer manifest.
+ *
+ * Take the start once, from the oldest edge of all video and audio
+ * representations, and use it for every representation.
+ */
+static int64_t calc_common_live_start(DASHContext *c)
+{
+    int64_t edge = INT64_MAX;
+    int64_t delay = live_delay(c);
+    int i;
+
+    for (i = 0; i < c->n_videos; i++)
+        edge = FFMIN(edge, timeline_end_time(c->videos[i]));
+    for (i = 0; i < c->n_audios; i++)
+        edge = FFMIN(edge, timeline_end_time(c->audios[i]));
+
+    if (edge == INT64_MAX)
+        return AV_NOPTS_VALUE;
+    return edge - delay * AV_TIME_BASE;
+}
+
 static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
 {
     DASHContext *c = s->priv_data;
@@ -1456,7 +1523,13 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
             num = pls->first_seq_no;
         } else if (pls->n_timelines) {
             av_log(s, AV_LOG_TRACE, "in n_timelines mode\n");
-            if (c->min_buffer_time > 0)
+            if (c->live_start_time == AV_NOPTS_VALUE)
+                c->live_start_time = calc_common_live_start(c);
+            if (c->live_start_time != AV_NOPTS_VALUE)
+            {
+                start_time_offset = av_rescale(c->live_start_time, pls->fragment_timescale, AV_TIME_BASE);
+            }
+            else if (c->min_buffer_time > 0)
             {
                 start_time_offset = get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF) - (2 * c->min_buffer_time) * pls->fragment_timescale;
             }
@@ -1764,6 +1837,8 @@ try_again:
         }
         if (pls->cur_seq_no < min_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
+            /* fell out of the time shift buffer, start again from the current edge */
+            c->live_start_time = AV_NOPTS_VALUE;
             pls->cur_seq_no = calc_cur_seg_no(pls->parent, pls);
         } else if (pls->cur_seq_no > max_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "new fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
@@ -2210,6 +2285,8 @@ static int dash_read_header(AVFormatContext *s)
     int i;
 
     c->interrupt_callback = &s->interrupt_callback;
+    c->live_start_time = AV_NOPTS_VALUE;
+    c->first_pts_time = AV_NOPTS_VALUE;
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
@@ -2394,15 +2471,26 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (ret >= 0) {
             if(cur->n_fragments != 1)
             {
-                /* in multifragments mode - ensure, that PTS always starts from 0 */
-                if(cur->first_pts == INT64_MIN)
+                /* in multifragments mode - ensure, that PTS always starts from 0.
+                 * All representations subtract the same media time - the time of
+                 * the first packet of the session - so that the offset between
+                 * audio and video is kept instead of being cut away. */
+                if (cur->first_pts == INT64_MIN && pkt->pts != AV_NOPTS_VALUE)
                 {
+                    AVRational tb = cur->ctx->streams[0]->time_base;
+                    if (c->first_pts_time == AV_NOPTS_VALUE)
+                        c->first_pts_time = av_rescale_q(pkt->pts, tb, AV_TIME_BASE_Q);
+                    cur->first_pts = av_rescale_q(c->first_pts_time, AV_TIME_BASE_Q, tb);
                     av_log(c, AV_LOG_TRACE, "Setting first PTS to pos[%" PRId64 "] for %s\n", cur->first_pts, cur->id);
-                    cur->first_pts = pkt->pts;
                 }
 
-                pkt->pts -= cur->first_pts;
-                pkt->dts -= cur->first_pts;
+                if (cur->first_pts != INT64_MIN)
+                {
+                    if (pkt->pts != AV_NOPTS_VALUE)
+                        pkt->pts -= cur->first_pts;
+                    if (pkt->dts != AV_NOPTS_VALUE)
+                        pkt->dts -= cur->first_pts;
+                }
             }
 
             /* If we got a packet, return it */
@@ -2574,6 +2662,7 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "live_delay", "distance to the live edge in seconds when starting a live stream (0 = automatic)", OFFSET(live_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3600, .flags = FLAGS },
     { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     {NULL}
 };
