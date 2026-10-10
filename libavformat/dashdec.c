@@ -30,6 +30,8 @@
 #include "dash.h"
 #include "demux.h"
 #include "url.h"
+#include "config_components.h"
+#include "http.h"
 
 #define INITIAL_BUFFER_SIZE 32768
 
@@ -119,6 +121,8 @@ struct representation {
     int64_t cur_timestamp;
     int64_t first_pts;
     int is_restart_needed;
+    int input_read_done; /* segment read to its end, connection still usable */
+    int input_reuse;     /* demuxer restarted: send the next request on that connection */
 
     char *cenc_decryption_key;
     char *cenc_decryption_keys;
@@ -180,6 +184,12 @@ typedef struct DASHContext {
     int64_t first_pts_time;
     /* Option: distance to the live edge in seconds, 0 = automatic */
     int live_delay;
+    /* Option: reuse HTTP connections for segments and manifest */
+    int http_persistent;
+    AVIOContext *mpd_pb;
+    /* redirect learned from the CDN: requests to redirect_from go to redirect_to */
+    char *redirect_from;
+    char *redirect_to;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -423,6 +433,123 @@ static void free_subtitle_list(DASHContext *c)
     c->n_subtitles = 0;
 }
 
+static int same_http_host(AVIOContext *pb, const char *url)
+{
+    char *location = NULL;
+    char host1[1024], host2[1024], proto1[10], proto2[10];
+    int port1, port2, ret;
+
+    if (av_opt_get(pb, "location", AV_OPT_SEARCH_CHILDREN, (uint8_t **)&location) < 0 || !location)
+        return 0;
+    av_url_split(proto1, sizeof(proto1), NULL, 0, host1, sizeof(host1), &port1, NULL, 0, location);
+    av_url_split(proto2, sizeof(proto2), NULL, 0, host2, sizeof(host2), &port2, NULL, 0, url);
+    ret = port1 == port2 && !strcmp(host1, host2) && !strcmp(proto1, proto2);
+    av_free(location);
+    return ret;
+}
+
+/* Send the next request over an already open HTTP connection.
+ * The caller closes *pb and opens a new connection if this fails. */
+static int open_url_keepalive(AVIOContext **pb, const char *url, AVDictionary **options)
+{
+#if !CONFIG_HTTP_PROTOCOL
+    return AVERROR_PROTOCOL_NOT_FOUND;
+#else
+    URLContext *uc = ffio_geturlcontext(*pb);
+
+    if (!uc || (*pb)->error || !same_http_host(*pb, url))
+        return AVERROR(EINVAL);
+    (*pb)->eof_reached = 0;
+    return ff_http_do_new_request2(uc, url, options);
+#endif
+}
+
+/* Open url on *pb - over the connection already open when reuse is set and
+ * possible, otherwise over a new one. */
+static int open_reuse(AVFormatContext *s, AVIOContext **pb, const char *url,
+                      AVDictionary *opts, AVDictionary *opts2, int reuse)
+{
+    AVDictionary *tmp = NULL;
+    int ret = AVERROR(EINVAL);
+
+    if (reuse && *pb) {
+        av_dict_copy(&tmp, opts, 0);
+        av_dict_copy(&tmp, opts2, 0);
+        ret = open_url_keepalive(pb, url, &tmp);
+        av_dict_free(&tmp);
+        if (ret == AVERROR_EXIT)
+            return ret;
+        if (ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EINVAL))
+            av_log(s, AV_LOG_VERBOSE,
+                   "keepalive request failed for '%s' with error: '%s', retrying with new connection\n",
+                   url, av_err2str(ret));
+    }
+    if (ret < 0) {
+        ff_format_io_close(s, pb);
+        av_dict_copy(&tmp, opts, 0);
+        av_dict_copy(&tmp, opts2, 0);
+        ret = s->io_open(s, pb, url, AVIO_FLAG_READ, &tmp);
+        av_dict_free(&tmp);
+    }
+    return ret;
+}
+
+/* offset of the path in an absolute URL, -1 if there is none */
+static int url_path_offset(const char *url)
+{
+    const char *p = strstr(url, "://");
+
+    if (!p)
+        return -1;
+    p = strchr(p + 3, '/');
+    return p ? p - url : -1;
+}
+
+static void forget_redirect(DASHContext *c)
+{
+    av_freep(&c->redirect_from);
+    av_freep(&c->redirect_to);
+}
+
+/* Some CDNs answer every request with a redirect to an edge server that keeps
+ * the path ("https://cdn/x" -> "https://edge/prefix/cdn/x"). Remember it, so that
+ * further requests go straight to that edge: one connection instead of two per
+ * request, and one that can be kept alive. */
+static void learn_redirect(AVFormatContext *s, DASHContext *c, const char *url, AVIOContext *pb)
+{
+    char *location = NULL;
+    int off = url_path_offset(url);
+    size_t len_loc, len_rest;
+
+    if (off < 0 || c->redirect_from)
+        return;
+    if (av_opt_get(pb, "location", AV_OPT_SEARCH_CHILDREN, (uint8_t **)&location) < 0 || !location)
+        return;
+    len_loc  = strlen(location);
+    len_rest = strlen(url + off);
+    if (strcmp(location, url) && len_loc > len_rest &&
+        !strcmp(location + len_loc - len_rest, url + off) &&
+        url_path_offset(location) >= 0 && url_path_offset(location) <= (int)(len_loc - len_rest)) {
+        c->redirect_from = av_strndup(url, off);
+        c->redirect_to   = av_strndup(location, len_loc - len_rest);
+        if (!c->redirect_from || !c->redirect_to)
+            forget_redirect(c);
+        else
+            av_log(s, AV_LOG_VERBOSE, "Sending further requests for %s to %s\n",
+                   c->redirect_from, c->redirect_to);
+    }
+    av_free(location);
+}
+
+static char *map_redirect(DASHContext *c, const char *url)
+{
+    const char *rest;
+
+    if (!c->redirect_from || !av_strstart(url, c->redirect_from, &rest) || *rest != '/')
+        return NULL;
+    return av_asprintf("%s%s", c->redirect_to, rest);
+}
+
 static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
                     AVDictionary **opts, AVDictionary *opts2, int *is_http)
 {
@@ -430,7 +557,8 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     AVDictionary *tmp = NULL;
     const char *proto_name = NULL;
     int proto_name_len;
-    int ret;
+    int ret, reuse;
+    char *mapped;
 
     if (av_strstart(url, "crypto", NULL)) {
         if (url[6] == '+' || url[6] == ':')
@@ -465,10 +593,27 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
         return AVERROR_INVALIDDATA;
 
-    av_freep(pb);
-    av_dict_copy(&tmp, *opts, 0);
-    av_dict_copy(&tmp, opts2, 0);
-    ret = s->io_open(s, pb, url, AVIO_FLAG_READ, &tmp);
+    reuse  = c->http_persistent && av_strstart(proto_name, "http", NULL);
+    mapped = reuse ? map_redirect(c, url) : NULL;
+    ret = AVERROR(EINVAL);
+    if (mapped) {
+        ret = open_reuse(s, pb, mapped, *opts, opts2, reuse);
+        if (ret < 0 && ret != AVERROR_EXIT) {
+            av_log(s, AV_LOG_VERBOSE, "Request to '%s' failed with error: '%s', asking '%s' again\n",
+                   mapped, av_err2str(ret), c->redirect_from);
+            forget_redirect(c);
+        }
+        av_free(mapped);
+        if (ret == AVERROR_EXIT)
+            return ret;
+    }
+    if (ret < 0) {
+        if (!reuse)
+            ff_format_io_close(s, pb);
+        ret = open_reuse(s, pb, url, *opts, opts2, reuse);
+        if (ret >= 0 && reuse)
+            learn_redirect(s, c, url, *pb);
+    }
     if (ret >= 0) {
         // update cookies on http response with setcookies.
         char *new_cookies = NULL;
@@ -1297,6 +1442,16 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
     uint32_t period_duration_sec = 0;
     uint32_t period_start_sec = 0;
 
+    if (!in && c->http_persistent && ishttp((char *)url)) {
+        /* manifest refresh: keep one connection open for all reloads */
+        av_dict_set(&opts, "multiple_requests", "1", 0);
+        ret = open_url(s, &c->mpd_pb, url, &c->avio_opts, opts, NULL);
+        av_dict_free(&opts);
+        if (ret < 0)
+            return ret;
+        in = c->mpd_pb;
+    }
+
     if (!in) {
         close_in = 1;
 
@@ -1449,6 +1604,9 @@ cleanup:
     av_bprint_finalize(&buf, NULL);
     if (close_in) {
         ff_format_io_close(s, &in);
+    } else if (in && in == c->mpd_pb && (!avio_feof(in) || in->error)) {
+        /* not read to its end - the connection cannot carry the next request */
+        ff_format_io_close(s, &c->mpd_pb);
     }
     return ret;
 }
@@ -2019,7 +2177,9 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
     DASHContext *c = v->parent->priv_data;
 
 restart:
-    if (!v->input) {
+    if (!v->input || v->input_reuse) {
+        v->input_reuse = 0;
+        v->input_read_done = 0;
         free_fragment(&v->cur_seg);
         v->cur_seg = get_current_fragment(v);
         if (!v->cur_seg) {
@@ -2069,6 +2229,9 @@ restart:
         if (!v->is_restart_needed)
             v->cur_seq_no++;
         v->is_restart_needed = 1;
+        /* segment completely received: keep the connection for the next one */
+        if (c->http_persistent && v->input && avio_feof(v->input) && !v->input->error)
+            v->input_read_done = 1;
     }
 
 end:
@@ -2502,7 +2665,10 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
             cur->cur_seg_offset = 0;
             cur->init_sec_buf_read_offset = 0;
             cur->is_restart_needed = 0;
-            ff_format_io_close(cur->parent, &cur->input);
+            if (cur->input_read_done)
+                cur->input_reuse = 1;
+            else
+                ff_format_io_close(cur->parent, &cur->input);
             ret = reopen_demux_for_component(s, cur);
         }
     }
@@ -2516,6 +2682,8 @@ static int dash_close(AVFormatContext *s)
     free_video_list(c);
     free_subtitle_list(c);
     av_dict_free(&c->avio_opts);
+    ff_format_io_close(s, &c->mpd_pb);
+    forget_redirect(c);
     av_freep(&c->base_url);
     return 0;
 }
@@ -2663,6 +2831,7 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "live_delay", "distance to the live edge in seconds when starting a live stream (0 = automatic)", OFFSET(live_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3600, .flags = FLAGS },
+    { "http_persistent", "Use persistent HTTP connections", OFFSET(http_persistent), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, .flags = FLAGS },
     { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     {NULL}
 };
