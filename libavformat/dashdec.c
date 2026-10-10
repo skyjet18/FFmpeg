@@ -30,6 +30,8 @@
 #include "dash.h"
 #include "demux.h"
 #include "url.h"
+#include "config_components.h"
+#include "http.h"
 
 #define INITIAL_BUFFER_SIZE 32768
 
@@ -119,6 +121,8 @@ struct representation {
     int64_t cur_timestamp;
     int64_t first_pts;
     int is_restart_needed;
+    int input_read_done; /* segment read to its end, connection still usable */
+    int input_reuse;     /* demuxer restarted: send the next request on that connection */
 
     char *cenc_decryption_key;
     char *cenc_decryption_keys;
@@ -171,6 +175,21 @@ typedef struct DASHContext {
 
     uint64_t playlist_load_time;
     int fake_last_subtitle;
+
+    /* Common start position for live SegmentTimeline streams, in
+     * AV_TIME_BASE units; AV_NOPTS_VALUE until it has been computed. */
+    int64_t live_start_time;
+    /* Media time subtracted from the timestamps of every representation,
+     * in AV_TIME_BASE units; AV_NOPTS_VALUE until the first packet. */
+    int64_t first_pts_time;
+    /* Option: distance to the live edge in seconds, 0 = automatic */
+    int live_delay;
+    /* Option: reuse HTTP connections for segments and manifest */
+    int http_persistent;
+    AVIOContext *mpd_pb;
+    /* redirect learned from the CDN: requests to redirect_from go to redirect_to */
+    char *redirect_from;
+    char *redirect_to;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -414,6 +433,123 @@ static void free_subtitle_list(DASHContext *c)
     c->n_subtitles = 0;
 }
 
+static int same_http_host(AVIOContext *pb, const char *url)
+{
+    char *location = NULL;
+    char host1[1024], host2[1024], proto1[10], proto2[10];
+    int port1, port2, ret;
+
+    if (av_opt_get(pb, "location", AV_OPT_SEARCH_CHILDREN, (uint8_t **)&location) < 0 || !location)
+        return 0;
+    av_url_split(proto1, sizeof(proto1), NULL, 0, host1, sizeof(host1), &port1, NULL, 0, location);
+    av_url_split(proto2, sizeof(proto2), NULL, 0, host2, sizeof(host2), &port2, NULL, 0, url);
+    ret = port1 == port2 && !strcmp(host1, host2) && !strcmp(proto1, proto2);
+    av_free(location);
+    return ret;
+}
+
+/* Send the next request over an already open HTTP connection.
+ * The caller closes *pb and opens a new connection if this fails. */
+static int open_url_keepalive(AVIOContext **pb, const char *url, AVDictionary **options)
+{
+#if !CONFIG_HTTP_PROTOCOL
+    return AVERROR_PROTOCOL_NOT_FOUND;
+#else
+    URLContext *uc = ffio_geturlcontext(*pb);
+
+    if (!uc || (*pb)->error || !same_http_host(*pb, url))
+        return AVERROR(EINVAL);
+    (*pb)->eof_reached = 0;
+    return ff_http_do_new_request2(uc, url, options);
+#endif
+}
+
+/* Open url on *pb - over the connection already open when reuse is set and
+ * possible, otherwise over a new one. */
+static int open_reuse(AVFormatContext *s, AVIOContext **pb, const char *url,
+                      AVDictionary *opts, AVDictionary *opts2, int reuse)
+{
+    AVDictionary *tmp = NULL;
+    int ret = AVERROR(EINVAL);
+
+    if (reuse && *pb) {
+        av_dict_copy(&tmp, opts, 0);
+        av_dict_copy(&tmp, opts2, 0);
+        ret = open_url_keepalive(pb, url, &tmp);
+        av_dict_free(&tmp);
+        if (ret == AVERROR_EXIT)
+            return ret;
+        if (ret < 0 && ret != AVERROR_EOF && ret != AVERROR(EINVAL))
+            av_log(s, AV_LOG_VERBOSE,
+                   "keepalive request failed for '%s' with error: '%s', retrying with new connection\n",
+                   url, av_err2str(ret));
+    }
+    if (ret < 0) {
+        ff_format_io_close(s, pb);
+        av_dict_copy(&tmp, opts, 0);
+        av_dict_copy(&tmp, opts2, 0);
+        ret = s->io_open(s, pb, url, AVIO_FLAG_READ, &tmp);
+        av_dict_free(&tmp);
+    }
+    return ret;
+}
+
+/* offset of the path in an absolute URL, -1 if there is none */
+static int url_path_offset(const char *url)
+{
+    const char *p = strstr(url, "://");
+
+    if (!p)
+        return -1;
+    p = strchr(p + 3, '/');
+    return p ? p - url : -1;
+}
+
+static void forget_redirect(DASHContext *c)
+{
+    av_freep(&c->redirect_from);
+    av_freep(&c->redirect_to);
+}
+
+/* Some CDNs answer every request with a redirect to an edge server that keeps
+ * the path ("https://cdn/x" -> "https://edge/prefix/cdn/x"). Remember it, so that
+ * further requests go straight to that edge: one connection instead of two per
+ * request, and one that can be kept alive. */
+static void learn_redirect(AVFormatContext *s, DASHContext *c, const char *url, AVIOContext *pb)
+{
+    char *location = NULL;
+    int off = url_path_offset(url);
+    size_t len_loc, len_rest;
+
+    if (off < 0 || c->redirect_from)
+        return;
+    if (av_opt_get(pb, "location", AV_OPT_SEARCH_CHILDREN, (uint8_t **)&location) < 0 || !location)
+        return;
+    len_loc  = strlen(location);
+    len_rest = strlen(url + off);
+    if (strcmp(location, url) && len_loc > len_rest &&
+        !strcmp(location + len_loc - len_rest, url + off) &&
+        url_path_offset(location) >= 0 && url_path_offset(location) <= (int)(len_loc - len_rest)) {
+        c->redirect_from = av_strndup(url, off);
+        c->redirect_to   = av_strndup(location, len_loc - len_rest);
+        if (!c->redirect_from || !c->redirect_to)
+            forget_redirect(c);
+        else
+            av_log(s, AV_LOG_VERBOSE, "Sending further requests for %s to %s\n",
+                   c->redirect_from, c->redirect_to);
+    }
+    av_free(location);
+}
+
+static char *map_redirect(DASHContext *c, const char *url)
+{
+    const char *rest;
+
+    if (!c->redirect_from || !av_strstart(url, c->redirect_from, &rest) || *rest != '/')
+        return NULL;
+    return av_asprintf("%s%s", c->redirect_to, rest);
+}
+
 static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
                     AVDictionary **opts, AVDictionary *opts2, int *is_http)
 {
@@ -421,7 +557,8 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     AVDictionary *tmp = NULL;
     const char *proto_name = NULL;
     int proto_name_len;
-    int ret;
+    int ret, reuse;
+    char *mapped;
 
     if (av_strstart(url, "crypto", NULL)) {
         if (url[6] == '+' || url[6] == ':')
@@ -456,10 +593,27 @@ static int open_url(AVFormatContext *s, AVIOContext **pb, const char *url,
     else if (strcmp(proto_name, "file") || !strncmp(url, "file,", 5))
         return AVERROR_INVALIDDATA;
 
-    av_freep(pb);
-    av_dict_copy(&tmp, *opts, 0);
-    av_dict_copy(&tmp, opts2, 0);
-    ret = s->io_open(s, pb, url, AVIO_FLAG_READ, &tmp);
+    reuse  = c->http_persistent && av_strstart(proto_name, "http", NULL);
+    mapped = reuse ? map_redirect(c, url) : NULL;
+    ret = AVERROR(EINVAL);
+    if (mapped) {
+        ret = open_reuse(s, pb, mapped, *opts, opts2, reuse);
+        if (ret < 0 && ret != AVERROR_EXIT) {
+            av_log(s, AV_LOG_VERBOSE, "Request to '%s' failed with error: '%s', asking '%s' again\n",
+                   mapped, av_err2str(ret), c->redirect_from);
+            forget_redirect(c);
+        }
+        av_free(mapped);
+        if (ret == AVERROR_EXIT)
+            return ret;
+    }
+    if (ret < 0) {
+        if (!reuse)
+            ff_format_io_close(s, pb);
+        ret = open_reuse(s, pb, url, *opts, opts2, reuse);
+        if (ret >= 0 && reuse)
+            learn_redirect(s, c, url, *pb);
+    }
     if (ret >= 0) {
         // update cookies on http response with setcookies.
         char *new_cookies = NULL;
@@ -1288,6 +1442,16 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
     uint32_t period_duration_sec = 0;
     uint32_t period_start_sec = 0;
 
+    if (!in && c->http_persistent && ishttp((char *)url)) {
+        /* manifest refresh: keep one connection open for all reloads */
+        av_dict_set(&opts, "multiple_requests", "1", 0);
+        ret = open_url(s, &c->mpd_pb, url, &c->avio_opts, opts, NULL);
+        av_dict_free(&opts);
+        if (ret < 0)
+            return ret;
+        in = c->mpd_pb;
+    }
+
     if (!in) {
         close_in = 1;
 
@@ -1440,8 +1604,69 @@ cleanup:
     av_bprint_finalize(&buf, NULL);
     if (close_in) {
         ff_format_io_close(s, &in);
+    } else if (in && in == c->mpd_pb && (!avio_feof(in) || in->error)) {
+        /* not read to its end - the connection cannot carry the next request */
+        ff_format_io_close(s, &c->mpd_pb);
     }
     return ret;
+}
+
+static int64_t timeline_end_time(struct representation *pls)
+{
+    if (!pls->n_timelines || pls->fragment_timescale <= 0)
+        return INT64_MAX;
+    /* with a seq_no past the last segment this returns the end of the timeline */
+    return av_rescale(get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF),
+                      AV_TIME_BASE, pls->fragment_timescale);
+}
+
+/*
+ * Distance to the live edge in seconds. Twice minBufferTime is not enough
+ * for every packager: with minBufferTime="PT2S" (Sky) it leaves two to four
+ * seconds, while 1.92 s segments are published in bursts up to 3.4 s apart.
+ * The player then keeps catching up with the edge and the picture stalls.
+ * Use at least suggestedPresentationDelay and LIVE_DELAY_MIN seconds; the
+ * live_delay option overrides all of it.
+ */
+#define LIVE_DELAY_MIN 12
+
+static int64_t live_delay(DASHContext *c)
+{
+    int64_t delay;
+
+    if (c->live_delay > 0)
+        return c->live_delay;
+    delay = c->min_buffer_time > 0 ? 2 * c->min_buffer_time : 60;
+    delay = FFMAX(delay, (int64_t)c->suggested_presentation_delay);
+    return FFMAX(delay, LIVE_DELAY_MIN);
+}
+
+/*
+ * All representations of a live stream have to start at the same media time.
+ * Packagers do not publish all AdaptationSets at the same moment; the video
+ * timeline can end a whole segment later than the audio timeline. Computing
+ * the start from each representation's own edge then makes audio and video
+ * start one segment apart, and because the manifest is refreshed while the
+ * first representation is opened, later representations may even be
+ * positioned against a newer manifest.
+ *
+ * Take the start once, from the oldest edge of all video and audio
+ * representations, and use it for every representation.
+ */
+static int64_t calc_common_live_start(DASHContext *c)
+{
+    int64_t edge = INT64_MAX;
+    int64_t delay = live_delay(c);
+    int i;
+
+    for (i = 0; i < c->n_videos; i++)
+        edge = FFMIN(edge, timeline_end_time(c->videos[i]));
+    for (i = 0; i < c->n_audios; i++)
+        edge = FFMIN(edge, timeline_end_time(c->audios[i]));
+
+    if (edge == INT64_MAX)
+        return AV_NOPTS_VALUE;
+    return edge - delay * AV_TIME_BASE;
 }
 
 static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
@@ -1456,7 +1681,13 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
             num = pls->first_seq_no;
         } else if (pls->n_timelines) {
             av_log(s, AV_LOG_TRACE, "in n_timelines mode\n");
-            if (c->min_buffer_time > 0)
+            if (c->live_start_time == AV_NOPTS_VALUE)
+                c->live_start_time = calc_common_live_start(c);
+            if (c->live_start_time != AV_NOPTS_VALUE)
+            {
+                start_time_offset = av_rescale(c->live_start_time, pls->fragment_timescale, AV_TIME_BASE);
+            }
+            else if (c->min_buffer_time > 0)
             {
                 start_time_offset = get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF) - (2 * c->min_buffer_time) * pls->fragment_timescale;
             }
@@ -1561,6 +1792,28 @@ static void move_segments(struct representation *rep_src, struct representation 
 }
 
 
+/* Position of a representation after a manifest reload (SegmentTimeline).
+ * cur_seq_no is an absolute segment number (first_seq_no + index).
+ * $Number$ templates: the number stays valid, keep it; falling out of the
+ * window is handled later in get_current_fragment().
+ * Other templates: map via media time, old index -> time -> new index. */
+static int64_t refreshed_seq_no(DASHContext *c, struct representation *old, struct representation *neu)
+{
+    int64_t idx, t;
+
+    if (old->url_template && av_stristr(old->url_template, "$Number"))
+        return old->cur_seq_no;
+
+    idx = old->cur_seq_no - old->first_seq_no;
+    if (idx < 0)
+        idx = 0;
+    t = get_segment_start_time_based_on_timeline(old, idx);
+    idx = calc_next_seg_no_from_timelines(neu, t - 1);
+    if (idx < 0) /* not published yet: the next segment after the new timeline */
+        idx = calc_max_seg_no(neu, c) - neu->first_seq_no + 1;
+    return neu->first_seq_no + idx;
+}
+
 static int refresh_manifest(AVFormatContext *s)
 {
     int ret = 0, i;
@@ -1617,19 +1870,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_video = videos[i];
         struct representation *ccur_video = c->videos[i];
         if (cur_video->timelines) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_video, cur_video->cur_seq_no) / cur_video->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_video, currentTime * cur_video->fragment_timescale - 1) + cur_video->first_seq_no;
-
-            // update segments
-            if( cur_video->cur_seq_no > next_seg_no || cur_video->cur_seq_no < calc_min_seg_no(s, ccur_video) )
-            {
-                ccur_video->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_video->cur_seq_no = cur_video->cur_seq_no;
-            }
+            ccur_video->cur_seq_no = refreshed_seq_no(c, cur_video, ccur_video);
 
             if (ccur_video->cur_seq_no >= 0) {
                 move_timelines(ccur_video, cur_video, c);
@@ -1643,19 +1884,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_audio = audios[i];
         struct representation *ccur_audio = c->audios[i];
         if (cur_audio->timelines) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_audio, cur_audio->cur_seq_no) / cur_audio->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_audio, currentTime * cur_audio->fragment_timescale - 1) + cur_audio->first_seq_no;
-
-            // update segments
-            if( cur_audio->cur_seq_no > next_seg_no || cur_audio->cur_seq_no < calc_min_seg_no(s, ccur_audio))
-            {
-                ccur_audio->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_audio->cur_seq_no = cur_audio->cur_seq_no;
-            }
+            ccur_audio->cur_seq_no = refreshed_seq_no(c, cur_audio, ccur_audio);
 
             if (ccur_audio->cur_seq_no >= 0) {
                 move_timelines(ccur_audio, cur_audio, c);
@@ -1670,19 +1899,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_subtitle = subtitles[i];
         struct representation *ccur_subtitle = c->subtitles[i];
         if (cur_subtitle->timelines) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_subtitle, cur_subtitle->cur_seq_no) / cur_subtitle->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_subtitle, currentTime * cur_subtitle->fragment_timescale - 1) + cur_subtitle->first_seq_no;
-
-            // update segments
-            if( cur_subtitle->cur_seq_no > next_seg_no || cur_subtitle->cur_seq_no < calc_min_seg_no(s, ccur_subtitle))
-            {
-                ccur_subtitle->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_subtitle->cur_seq_no = cur_subtitle->cur_seq_no;
-            }
+            ccur_subtitle->cur_seq_no = refreshed_seq_no(c, cur_subtitle, ccur_subtitle);
 
             if (ccur_subtitle->cur_seq_no >= 0) {
                 move_timelines(ccur_subtitle, cur_subtitle, c);
@@ -1764,6 +1981,8 @@ try_again:
         }
         if (pls->cur_seq_no < min_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "old fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
+            /* fell out of the time shift buffer, start again from the current edge */
+            c->live_start_time = AV_NOPTS_VALUE;
             pls->cur_seq_no = calc_cur_seg_no(pls->parent, pls);
         } else if (pls->cur_seq_no > max_seq_no) {
             av_log(pls->parent, AV_LOG_VERBOSE, "new fragment: cur[%"PRId64"] min[%"PRId64"] max[%"PRId64"]\n", (int64_t)pls->cur_seq_no, min_seq_no, max_seq_no);
@@ -1944,7 +2163,9 @@ static int read_data(void *opaque, uint8_t *buf, int buf_size)
     DASHContext *c = v->parent->priv_data;
 
 restart:
-    if (!v->input) {
+    if (!v->input || v->input_reuse) {
+        v->input_reuse = 0;
+        v->input_read_done = 0;
         free_fragment(&v->cur_seg);
         v->cur_seg = get_current_fragment(v);
         if (!v->cur_seg) {
@@ -1994,6 +2215,9 @@ restart:
         if (!v->is_restart_needed)
             v->cur_seq_no++;
         v->is_restart_needed = 1;
+        /* segment completely received: keep the connection for the next one */
+        if (c->http_persistent && v->input && avio_feof(v->input) && !v->input->error)
+            v->input_read_done = 1;
     }
 
 end:
@@ -2210,6 +2434,8 @@ static int dash_read_header(AVFormatContext *s)
     int i;
 
     c->interrupt_callback = &s->interrupt_callback;
+    c->live_start_time = AV_NOPTS_VALUE;
+    c->first_pts_time = AV_NOPTS_VALUE;
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
@@ -2394,15 +2620,26 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (ret >= 0) {
             if(cur->n_fragments != 1)
             {
-                /* in multifragments mode - ensure, that PTS always starts from 0 */
-                if(cur->first_pts == INT64_MIN)
+                /* in multifragments mode - ensure, that PTS always starts from 0.
+                 * All representations subtract the same media time - the time of
+                 * the first packet of the session - so that the offset between
+                 * audio and video is kept instead of being cut away. */
+                if (cur->first_pts == INT64_MIN && pkt->pts != AV_NOPTS_VALUE)
                 {
+                    AVRational tb = cur->ctx->streams[0]->time_base;
+                    if (c->first_pts_time == AV_NOPTS_VALUE)
+                        c->first_pts_time = av_rescale_q(pkt->pts, tb, AV_TIME_BASE_Q);
+                    cur->first_pts = av_rescale_q(c->first_pts_time, AV_TIME_BASE_Q, tb);
                     av_log(c, AV_LOG_TRACE, "Setting first PTS to pos[%" PRId64 "] for %s\n", cur->first_pts, cur->id);
-                    cur->first_pts = pkt->pts;
                 }
 
-                pkt->pts -= cur->first_pts;
-                pkt->dts -= cur->first_pts;
+                if (cur->first_pts != INT64_MIN)
+                {
+                    if (pkt->pts != AV_NOPTS_VALUE)
+                        pkt->pts -= cur->first_pts;
+                    if (pkt->dts != AV_NOPTS_VALUE)
+                        pkt->dts -= cur->first_pts;
+                }
             }
 
             /* If we got a packet, return it */
@@ -2414,7 +2651,10 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
             cur->cur_seg_offset = 0;
             cur->init_sec_buf_read_offset = 0;
             cur->is_restart_needed = 0;
-            ff_format_io_close(cur->parent, &cur->input);
+            if (cur->input_read_done)
+                cur->input_reuse = 1;
+            else
+                ff_format_io_close(cur->parent, &cur->input);
             ret = reopen_demux_for_component(s, cur);
         }
     }
@@ -2428,6 +2668,8 @@ static int dash_close(AVFormatContext *s)
     free_video_list(c);
     free_subtitle_list(c);
     av_dict_free(&c->avio_opts);
+    ff_format_io_close(s, &c->mpd_pb);
+    forget_redirect(c);
     av_freep(&c->base_url);
     return 0;
 }
@@ -2574,6 +2816,8 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "live_delay", "distance to the live edge in seconds when starting a live stream (0 = automatic)", OFFSET(live_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3600, .flags = FLAGS },
+    { "http_persistent", "Use persistent HTTP connections", OFFSET(http_persistent), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, .flags = FLAGS },
     { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     {NULL}
 };
