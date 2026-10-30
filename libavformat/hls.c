@@ -50,6 +50,9 @@
 
 #define INITIAL_BUFFER_SIZE 32768
 
+/* timestamp offsets of the last discontinuity regions, see HLSContext */
+#define HLS_DISC_OFFSETS 16
+
 #define MAX_FIELD_LEN 64
 #define MAX_CHARACTERISTICS_LEN 512
 
@@ -76,8 +79,10 @@ enum KeyType {
 
 struct segment {
     int64_t duration;
+    int64_t discontinuity_sequence;
     int64_t url_offset;
     int64_t size;
+    int discontinuity;
     char *url;
     char *key;
     enum KeyType key_type;
@@ -106,6 +111,7 @@ struct playlist {
     AVIOContext *input;
     int input_read_done;
     int64_t input_end; /* end of the byte range requested on input, or -1 */
+    int discontinuity_pending;
     AVIOContext *input_next;
     int input_next_requested;
     int64_t input_next_end;
@@ -132,6 +138,32 @@ struct playlist {
     int broken;
     int64_t cur_seq_no;
     int64_t last_seq_no;
+    /* #EXT-X-DISCONTINUITY: has_discontinuity is set once the playlist has
+     * carried the tag (kept across reloads); everything that changes the
+     * reading (demuxer restarts, timestamp offsets, selection by timestamp)
+     * is gated on it, a playlist without the tag is read as before.
+     * discontinuity_sequence_seen: the last parse had a valid
+     * #EXT-X-DISCONTINUITY-SEQUENCE, the region numbers are those of the
+     * server and shared with the other playlists. */
+    int has_discontinuity;
+    int discontinuity_sequence_seen;
+    /* The discontinuity sequence of the region the segment demuxer
+     * currently reads, the first segment of that region and the offset
+     * (AV_TIME_BASE) that maps the raw timestamps of the region onto the
+     * continuous presentation timeline, AV_NOPTS_VALUE until the first
+     * packet of the region tells it. discontinuity_region_start: the next
+     * packet is the first one since the region was (re)started. */
+    int64_t active_discontinuity_sequence;
+    int64_t discontinuity_start_seq_no;
+    int64_t discontinuity_offset;
+    int discontinuity_region_start;
+    /* Anchor of the presentation timeline on this playlist: segment
+     * timeline_seq_no starts at timeline_time (AV_TIME_BASE). Set by the
+     * first packet after a (re)start, moved along when segments drop out of
+     * a live window, AV_NOPTS_VALUE until then and after a reload that
+     * shares no segment with the previous list. */
+    int64_t timeline_seq_no;
+    int64_t timeline_time;
     int m3u8_hold_counters;
     int64_t cur_seg_offset;
     int64_t last_load_time;
@@ -234,6 +266,18 @@ typedef struct HLSContext {
     int64_t first_timestamp;
     struct playlist *first_timestamp_pls;
     int64_t cur_timestamp;
+    /* Timestamp offsets of the last discontinuity regions. An entry without
+     * owner belongs to a region numbered by #EXT-X-DISCONTINUITY-SEQUENCE
+     * and is shared by all playlists that carry it (the renditions of a
+     * stream carry the same timestamps and the same numbers); the local
+     * numbers of a playlist without it only match its own entries. */
+    struct {
+        int64_t sequence;
+        int64_t offset;
+        const struct playlist *owner;
+    } disc_offsets[HLS_DISC_OFFSETS];
+    int n_disc_offsets;
+    int disc_offsets_next;
     AVIOInterruptCB *interrupt_callback;
     AVDictionary *avio_opts;
     AVDictionary *seg_format_opts;
@@ -357,6 +401,8 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
     av_strlcpy(pls->url, abs_url, sizeof(pls->url));
     pls->ts_offset = AV_NOPTS_VALUE;
     pls->seek_timestamp = AV_NOPTS_VALUE;
+    pls->discontinuity_offset = 0;
+    pls->timeline_time = AV_NOPTS_VALUE;
 
     pls->is_id3_timestamped = -1;
     pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
@@ -815,6 +861,93 @@ static int test_segment(AVFormatContext *s, const AVInputFormat *in_fmt, struct 
     return 0;
 }
 
+/* After the reload of a live playlist: keep the discontinuity sequence
+ * numbers and the timeline anchor consistent with the previous segment
+ * list. */
+static void reload_discontinuity_state(HLSContext *c, struct playlist *pls,
+                                       struct segment **prev_segments,
+                                       int prev_n_segments,
+                                       int64_t prev_start_seq_no,
+                                       int sequence_seen)
+{
+    /* index of the new first segment in the previous list */
+    int64_t overlap = pls->start_seq_no - prev_start_seq_no;
+    /* a segment both lists contain: prev_segments[pi] is pls->segments[ni] */
+    int64_t pi = -1, ni = -1, delta = 0, i, j;
+    /* Without #EXT-X-DISCONTINUITY-SEQUENCE the numbering of every parse
+     * starts at 0 and changes whenever a discontinuity drops out of the
+     * window: continue the numbering of the previous list instead. Only for
+     * playlists with discontinuities, the numbers of the others stay 0. */
+    int renumber = pls->has_discontinuity && !sequence_seen;
+
+    if (!pls->n_segments || !prev_n_segments)
+        return;
+
+    if (overlap >= 0 && overlap < prev_n_segments) {
+        pi = overlap;
+        ni = 0;
+    } else if (overlap < 0 && -overlap < pls->n_segments) {
+        /* the media sequence went back (e.g. a lagging CDN edge), the
+         * lists still share segments */
+        pi = 0;
+        ni = -overlap;
+    } else if (overlap < 0 && pls->has_discontinuity) {
+        /* the media sequence went back out of the previous window: the same
+         * content renumbered if a segment URL of the previous list is still
+         * there, else a restarted sequence */
+        for (j = 0; pi < 0 && j < pls->n_segments; j++)
+            for (i = 0; i < prev_n_segments; i++)
+                if (pls->segments[j]->url_offset == prev_segments[i]->url_offset &&
+                    !strcmp(pls->segments[j]->url, prev_segments[i]->url)) {
+                    pi = i;
+                    ni = j;
+                    break;
+                }
+    }
+
+    if (pi < 0) {
+        /* No segment in common: a window after a long time without reload
+         * or a restarted media sequence. A new local region, so that no
+         * stale region number or offset matches, and no anchor: the time
+         * in between is unknown. */
+        if (renumber)
+            delta = av_sat_sub64(av_sat_add64(prev_segments[prev_n_segments - 1]->discontinuity_sequence, 1),
+                                 pls->segments[0]->discontinuity_sequence);
+        if (pls->timeline_time != AV_NOPTS_VALUE)
+            av_log(c->ctx, AV_LOG_DEBUG, "Timeline anchor of playlist %d dropped, the reloaded "
+                   "list shares no segment with the previous one\n", pls->index);
+        pls->timeline_time = AV_NOPTS_VALUE;
+    } else {
+        if (renumber)
+            delta = av_sat_sub64(prev_segments[pi]->discontinuity_sequence,
+                                 pls->segments[ni]->discontinuity_sequence);
+
+        /* Keep the anchor on its segment (renumbered if the match was by
+         * URL) and move it forward to the new first segment only when its
+         * segment dropped out of the window, by the durations in between. */
+        if (pls->timeline_time != AV_NOPTS_VALUE) {
+            int64_t shift = (prev_start_seq_no + pi) - (pls->start_seq_no + ni);
+            int64_t from  = av_clip64(pls->timeline_seq_no - prev_start_seq_no, 0, prev_n_segments);
+            int64_t time  = pls->timeline_time;
+
+            pls->timeline_seq_no -= shift;
+            if (pls->timeline_seq_no < pls->start_seq_no) {
+                for (i = from; i < pi - ni; i++)
+                    time = av_sat_add64(time, prev_segments[i]->duration);
+                av_log(c->ctx, AV_LOG_DEBUG, "Timeline anchor of playlist %d moved from segment %"PRId64
+                       " (%"PRId64") to %"PRId64" (%"PRId64")\n", pls->index, pls->timeline_seq_no,
+                       pls->timeline_time, pls->start_seq_no, time);
+                pls->timeline_seq_no = pls->start_seq_no;
+                pls->timeline_time   = time;
+            }
+        }
+    }
+
+    for (i = 0; delta && i < pls->n_segments; i++)
+        pls->segments[i]->discontinuity_sequence =
+            av_sat_add64(pls->segments[i]->discontinuity_sequence, delta);
+}
+
 static int parse_playlist(HLSContext *c, const char *url,
                           struct playlist *pls, AVIOContext *in)
 {
@@ -837,6 +970,10 @@ static int parse_playlist(HLSContext *c, const char *url,
     struct segment **prev_segments = NULL;
     int prev_n_segments = 0;
     int64_t prev_start_seq_no = -1;
+    int64_t discontinuity_sequence = 0;
+    int discontinuity = 0;
+    int discontinuity_sequence_seen = 0;
+    int segment_seen = 0;
 
     if (is_http && !in && c->http_persistent && c->playlist_pb) {
         in = c->playlist_pb;
@@ -951,6 +1088,22 @@ static int parse_playlist(HLSContext *c, const char *url,
                 seq_no &= INT64_MAX/2;
             }
             pls->start_seq_no = seq_no;
+        } else if (av_strstart(line, "#EXT-X-DISCONTINUITY-SEQUENCE:", &ptr)) {
+            char *end;
+            uint64_t seq_no;
+
+            ret = ensure_playlist(c, &pls, url);
+            if (ret < 0)
+                goto fail;
+            seq_no = strtoull(ptr, &end, 10);
+            if (segment_seen || discontinuity || discontinuity_sequence_seen ||
+                end == ptr || *end || seq_no > INT64_MAX) {
+                av_log(c->ctx, AV_LOG_WARNING,
+                       "Ignoring misplaced or invalid #EXT-X-DISCONTINUITY-SEQUENCE:%s\n", ptr);
+                continue;
+            }
+            discontinuity_sequence = seq_no;
+            discontinuity_sequence_seen = 1;
         } else if (av_strstart(line, "#EXT-X-PLAYLIST-TYPE:", &ptr)) {
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
@@ -1016,6 +1169,17 @@ static int parse_playlist(HLSContext *c, const char *url,
                                                 "invalid, it will be ignored");
                 continue;
             }
+        } else if (!strcmp(line, "#EXT-X-DISCONTINUITY")) {
+            ret = ensure_playlist(c, &pls, url);
+            if (ret < 0)
+                goto fail;
+            if (discontinuity_sequence == INT64_MAX) {
+                ret = AVERROR_INVALIDDATA;
+                goto fail;
+            }
+            discontinuity_sequence++;
+            discontinuity = 1;
+            pls->has_discontinuity = 1;
         } else if (av_strstart(line, "#EXT-X-ENDLIST", &ptr)) {
             if (pls)
                 pls->finished = 1;
@@ -1112,9 +1276,13 @@ static int parse_playlist(HLSContext *c, const char *url,
                     duration = 0.001 * AV_TIME_BASE;
                 }
                 seg->duration = duration;
+                seg->discontinuity_sequence = discontinuity_sequence;
+                seg->discontinuity = discontinuity;
                 seg->key_type = key_type;
                 dynarray_add(&pls->segments, &pls->n_segments, seg);
                 is_segment = 0;
+                discontinuity = 0;
+                segment_seen = 1;
 
                 seg->size = seg_size;
                 if (seg_size >= 0) {
@@ -1147,11 +1315,15 @@ static int parse_playlist(HLSContext *c, const char *url,
             av_log(c->ctx, AV_LOG_WARNING, "Media sequence changed unexpectedly: %"PRId64" -> %"PRId64"\n",
                    prev_start_seq_no, pls->start_seq_no);
         }
+        reload_discontinuity_state(c, pls, prev_segments, prev_n_segments,
+                                   prev_start_seq_no, discontinuity_sequence_seen);
         free_segment_dynarray(prev_segments, prev_n_segments);
         av_freep(&prev_segments);
     }
-    if (pls)
+    if (pls) {
+        pls->discontinuity_sequence_seen = discontinuity_sequence_seen;
         pls->last_load_time = av_gettime_relative();
+    }
 
 fail:
     av_free(new_url);
@@ -1176,12 +1348,85 @@ fail:
     return ret;
 }
 
-static struct segment *current_segment(struct playlist *pls)
+static struct segment *segment_at(struct playlist *pls, int64_t seq_no)
 {
-    int64_t n = pls->cur_seq_no - pls->start_seq_no;
-    if (n >= pls->n_segments)
+    int64_t n = seq_no - pls->start_seq_no;
+    if (n < 0 || n >= pls->n_segments)
         return NULL;
     return pls->segments[n];
+}
+
+static struct segment *current_segment(struct playlist *pls)
+{
+    return segment_at(pls, pls->cur_seq_no);
+}
+
+/* The offset of region sequence of pls: shared between the playlists only
+ * when the numbers come from #EXT-X-DISCONTINUITY-SEQUENCE. */
+static int64_t disc_offset_lookup(HLSContext *c, const struct playlist *pls,
+                                  int64_t sequence)
+{
+    const struct playlist *owner = pls->discontinuity_sequence_seen ? NULL : pls;
+
+    for (int i = 0; i < c->n_disc_offsets; i++)
+        if (c->disc_offsets[i].sequence == sequence &&
+            c->disc_offsets[i].owner == owner)
+            return c->disc_offsets[i].offset;
+    return AV_NOPTS_VALUE;
+}
+
+/* The first offset stored for a region stays. */
+static void disc_offset_store(HLSContext *c, const struct playlist *pls,
+                              int64_t sequence, int64_t offset)
+{
+    int i;
+
+    if (offset == AV_NOPTS_VALUE || pls->is_subtitle ||
+        disc_offset_lookup(c, pls, sequence) != AV_NOPTS_VALUE)
+        return;
+    i = c->disc_offsets_next;
+    c->disc_offsets_next = (i + 1) % HLS_DISC_OFFSETS;
+    c->n_disc_offsets = FFMIN(c->n_disc_offsets + 1, HLS_DISC_OFFSETS);
+    c->disc_offsets[i].sequence = sequence;
+    c->disc_offsets[i].offset   = offset;
+    c->disc_offsets[i].owner    = pls->discontinuity_sequence_seen ? NULL : pls;
+}
+
+/* The segment demuxer of pls (re)starts on cur_seq_no (start, seek, switch
+ * in, new subtitle region): take over the region of that segment. With
+ * lookup, a playlist with discontinuities keeps its offset if the region
+ * stays the same and else takes the stored one (AV_NOPTS_VALUE: computed
+ * from the first packet); without lookup (start of the demuxer) the offset
+ * stays as it is, 0 at the start. */
+static void discontinuity_select(HLSContext *c, struct playlist *pls, int lookup)
+{
+    struct segment *seg = current_segment(pls);
+
+    pls->discontinuity_pending      = 0;
+    pls->discontinuity_start_seq_no = pls->cur_seq_no;
+    pls->discontinuity_region_start = 1;
+    if (!seg)
+        return;
+    if (lookup && pls->has_discontinuity &&
+        (seg->discontinuity_sequence != pls->active_discontinuity_sequence ||
+         pls->discontinuity_offset == AV_NOPTS_VALUE)) {
+        disc_offset_store(c, pls, pls->active_discontinuity_sequence,
+                          pls->discontinuity_offset);
+        pls->discontinuity_offset = disc_offset_lookup(c, pls, seg->discontinuity_sequence);
+    }
+    pls->active_discontinuity_sequence = seg->discontinuity_sequence;
+}
+
+/* Does seg start a new discontinuity region for the segment demuxer? Never
+ * for a playlist without #EXT-X-DISCONTINUITY, its region is only tracked
+ * (a tag showing up later then compares against the right number). */
+static int discontinuity_changed(struct playlist *pls, const struct segment *seg)
+{
+    if (!pls->has_discontinuity) {
+        pls->active_discontinuity_sequence = seg->discontinuity_sequence;
+        return 0;
+    }
+    return seg->discontinuity_sequence != pls->active_discontinuity_sequence;
 }
 
 static struct segment *next_segment(struct playlist *pls)
@@ -1205,6 +1450,7 @@ static int segment_continues(const struct segment *cur,
            next->url_offset + next->size <= end &&
            cur->key_type == KEY_NONE && next->key_type == KEY_NONE &&
            next->init_section == cur->init_section &&
+           !next->discontinuity &&
            !strcmp(next->url, cur->url);
 }
 
@@ -1798,6 +2044,25 @@ reload:
     return ret;
 }
 
+/* The segment at cur_seq_no starts a new discontinuity region. Close the
+ * segment connections and let hls_read_packet() restart the segment
+ * demuxer on it; the next read opens the segment afresh. Only reached for
+ * playlists with discontinuities, see discontinuity_changed(). */
+static int discontinuity_restart(HLSContext *c, struct playlist *v, struct segment *seg)
+{
+    ff_format_io_close(v->parent, &v->input);
+    v->input_read_done = 0;
+    v->input_end = -1;
+    ff_format_io_close(v->parent, &v->input_next);
+    v->input_next_end = -1;
+    v->input_next_requested = 0;
+    /* a seek back into the region left reuses its offset */
+    disc_offset_store(c, v, v->active_discontinuity_sequence, v->discontinuity_offset);
+    v->active_discontinuity_sequence = seg->discontinuity_sequence;
+    v->discontinuity_pending = 1;
+    return AVERROR_EOF;
+}
+
 static int read_data_continuous(void *opaque, uint8_t *buf, int buf_size)
 {
     struct playlist *v = opaque;
@@ -1823,6 +2088,9 @@ restart:
     seg = current_segment(v);
 
     if (!v->input || v->input_read_done) {
+        if (discontinuity_changed(v, seg))
+            return discontinuity_restart(c, v, seg);
+
         /* load/update Media Initialization Section, if any */
         ret = update_init_section(v, seg);
         if (ret)
@@ -1870,7 +2138,8 @@ restart:
 
     seg = next_segment(v);
     if (c->http_multiple == 1 && !v->input_next_requested &&
-        seg && seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL) &&
+        seg && !seg->discontinuity &&
+        seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL) &&
         !segment_continues(current_segment(v), seg, v->input_end)) {
         ret = open_input(c, v, seg, &v->input_next, &v->input_next_end);
         if (ret < 0) {
@@ -1926,6 +2195,10 @@ restart:
 
     c->cur_seq_no = v->cur_seq_no;
 
+    seg = current_segment(v);
+    if (seg && discontinuity_changed(v, seg))
+        return discontinuity_restart(c, v, seg);
+
     goto restart;
 }
 
@@ -1954,6 +2227,34 @@ static int read_data_subtitle_segment(void *opaque, uint8_t *buf, int buf_size)
     }
 
     return read_from_url(v, seg, buf, buf_size);
+}
+
+/* Start of segment seq_no on the presentation timeline (AV_TIME_BASE): the
+ * timeline anchor of the playlist plus the EXTINF durations in between.
+ * Without an anchor (no packet read from the playlist yet, or a reload that
+ * shared no segment with the previous list) the first segment of the
+ * playlist is taken to start at c->first_timestamp, as
+ * find_timestamp_in_playlist() always assumed. Only used for playlists
+ * with discontinuities. */
+static int64_t segment_start_time(HLSContext *c, struct playlist *pls,
+                                  int64_t seq_no)
+{
+    int64_t time, anchor, i;
+
+    if (pls->timeline_time != AV_NOPTS_VALUE) {
+        time   = pls->timeline_time;
+        anchor = av_clip64(pls->timeline_seq_no - pls->start_seq_no, 0, pls->n_segments);
+    } else {
+        time   = c->first_timestamp == AV_NOPTS_VALUE ? 0 : c->first_timestamp;
+        anchor = 0;
+    }
+    seq_no = av_clip64(seq_no - pls->start_seq_no, 0, pls->n_segments);
+    for (i = anchor; i < seq_no; i++)
+        time = av_sat_add64(time, pls->segments[i]->duration);
+    for (i = seq_no; i < anchor; i++)
+        time = av_sat_sub64(time, pls->segments[i]->duration);
+
+    return time;
 }
 
 static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
@@ -2004,6 +2305,7 @@ static int init_subtitle_context(struct playlist *pls)
 static int read_subtitle_packet(struct playlist *v, AVPacket *pkt)
 {
     HLSContext *c = v->parent->priv_data;
+    struct segment *seg;
     int ret;
 
 restart:
@@ -2015,6 +2317,21 @@ restart:
         ff_format_io_close(v->parent, &v->input);
 
     if (!v->ctx) {
+        /* Every subtitle segment gets a fresh demuxer anyway, a new
+         * discontinuity region only needs its timestamp offset. Checked
+         * here, after the reload (which may renumber the regions) and for
+         * the first segment after a start, seek or switch in as well. */
+        seg = current_segment(v);
+        if (seg && discontinuity_changed(v, seg))
+            discontinuity_select(c, v, 1);
+        if (v->has_discontinuity) {
+            /* an offset of the audio/video playlists beats the estimate
+             * from the first cue */
+            int64_t offset = disc_offset_lookup(c, v, v->active_discontinuity_sequence);
+            if (offset != AV_NOPTS_VALUE)
+                v->discontinuity_offset = offset;
+        }
+
         ret = init_subtitle_context(v);
         if (ret < 0)
             return ret;
@@ -2094,8 +2411,9 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
                                       int64_t *seg_start_ts)
 {
     int i;
-    int64_t pos = c->first_timestamp == AV_NOPTS_VALUE ?
-                  0 : c->first_timestamp;
+    int64_t pos = pls->has_discontinuity ?
+                  segment_start_time(c, pls, pls->start_seq_no) :
+                  c->first_timestamp == AV_NOPTS_VALUE ? 0 : c->first_timestamp;
 
     if (timestamp < pos) {
         /* Seeking before the start of the playlist, clamp to the first segment. */
@@ -2122,6 +2440,37 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
     return 0;
 }
 
+/* Does pls number its segments like the playlists being read, so that
+ * c->cur_seq_no is the same content? Without #EXT-X-DISCONTINUITY-SEQUENCE
+ * it cannot be told and is assumed as before; with it the segment at
+ * c->cur_seq_no has to be in the same region as in another playlist that
+ * carries it. */
+static int shares_numbering(HLSContext *c, struct playlist *pls)
+{
+    const struct segment *seg = segment_at(pls, c->cur_seq_no);
+    int compared = 0;
+
+    if (!seg)
+        return 0;
+    if (!pls->discontinuity_sequence_seen)
+        return 1;
+    for (int i = 0; i < c->n_playlists; i++) {
+        struct playlist *other = c->playlists[i];
+        const struct segment *oseg;
+
+        if (other == pls || !other->needed || other->is_subtitle ||
+            !other->discontinuity_sequence_seen)
+            continue;
+        oseg = segment_at(other, c->cur_seq_no);
+        if (!oseg)
+            continue;
+        if (oseg->discontinuity_sequence == seg->discontinuity_sequence)
+            return 1;
+        compared = 1;
+    }
+    return !compared;
+}
+
 static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
 {
     int64_t seq_no;
@@ -2140,14 +2489,28 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
     }
 
     if (!pls->finished) {
-        if (!c->first_packet && /* we are doing a segment selection during playback */
-            c->cur_seq_no >= pls->start_seq_no &&
-            c->cur_seq_no < pls->start_seq_no + pls->n_segments)
-            /* While spec 3.4.3 says that we cannot assume anything about the
-             * content at the same sequence number on different playlists,
-             * in practice this seems to work and doing it otherwise would
-             * require us to download a segment to inspect its timestamps. */
-            return c->cur_seq_no;
+        if (!c->first_packet) { /* we are doing a segment selection during playback */
+            int in_window = c->cur_seq_no >= pls->start_seq_no &&
+                            c->cur_seq_no < pls->start_seq_no + pls->n_segments;
+
+            /* With discontinuities the same media sequence number need not
+             * be the same content: select by timestamp unless the playlist
+             * shares the numbering, but only from a timeline anchor that
+             * has followed the playlist (else from the media sequence if it
+             * is in the window). */
+            if (pls->has_discontinuity && c->cur_timestamp != AV_NOPTS_VALUE &&
+                (!in_window ||
+                 (pls->timeline_time != AV_NOPTS_VALUE && !shares_numbering(c, pls)))) {
+                find_timestamp_in_playlist(c, pls, c->cur_timestamp, &seq_no, NULL);
+                return seq_no;
+            }
+            if (in_window)
+                /* While spec 3.4.3 says that we cannot assume anything about the
+                 * content at the same sequence number on different playlists,
+                 * in practice this seems to work and doing it otherwise would
+                 * require us to download a segment to inspect its timestamps. */
+                return c->cur_seq_no;
+        }
 
         /* If this is a live stream, start live_start_index segments from the
          * start or end */
@@ -2333,6 +2696,8 @@ static int hls_read_header(AVFormatContext *s)
     c->first_timestamp = AV_NOPTS_VALUE;
     c->first_timestamp_pls = NULL;
     c->cur_timestamp = AV_NOPTS_VALUE;
+    c->n_disc_offsets = 0;
+    c->disc_offsets_next = 0;
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
@@ -2463,6 +2828,9 @@ static int hls_read_header(AVFormatContext *s)
             highest_cur_seq_no < pls->start_seq_no + pls->n_segments) {
             pls->cur_seq_no = highest_cur_seq_no;
         }
+
+        /* the region of the segment actually started on */
+        discontinuity_select(c, pls, 0);
 
         pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
         if (!pls->read_buffer){
@@ -2663,6 +3031,7 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             pls->needed = 1;
             changed = 1;
             pls->cur_seq_no = select_cur_seq_no(c, pls);
+            discontinuity_select(c, pls, 1);
             pls->pb.pub.eof_reached = 0;
             if (c->cur_timestamp != AV_NOPTS_VALUE) {
                 /* catch up */
@@ -2776,6 +3145,30 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                 else
                     ret = av_read_frame(pls->ctx, pls->pkt);
                 if (ret < 0) {
+                    if (pls->discontinuity_pending) {
+                        /* The next segment starts a new discontinuity
+                         * region: restart the segment demuxer on it (like
+                         * after a seek) and continue the timeline. */
+                        AVIOContext *pb = &pls->pb.pub;
+
+                        pls->discontinuity_pending = 0;
+                        pls->discontinuity_start_seq_no = pls->cur_seq_no;
+                        pls->discontinuity_region_start = 1;
+                        pls->discontinuity_offset =
+                            disc_offset_lookup(c, pls, pls->active_discontinuity_sequence);
+                        av_log(s, AV_LOG_VERBOSE, "Playlist %d: discontinuity sequence %"PRId64
+                               " starts at segment %"PRId64"\n", pls->index,
+                               pls->active_discontinuity_sequence, pls->cur_seq_no);
+                        pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
+                        pls->id3_offset = -1;
+                        pb->eof_reached = 0;
+                        pb->buf_end = pb->buf_ptr = pb->buffer;
+                        pb->pos = 0;
+                        ff_read_frame_flush(pls->ctx);
+                        for (unsigned j = 0; j < pls->ctx->nb_streams; j++)
+                            ffstream(pls->ctx->streams[j])->pts_wrap_reference = AV_NOPTS_VALUE;
+                        continue;
+                    }
                     if (!avio_feof(&pls->pb.pub) && ret != AVERROR_EOF)
                         return ret;
                     break;
@@ -2786,14 +3179,84 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                         fill_timing_for_id3_timestamped_stream(pls);
                     }
 
+                    if (pls->has_discontinuity &&
+                        pls->discontinuity_offset == AV_NOPTS_VALUE &&
+                        pls->pkt->dts != AV_NOPTS_VALUE) {
+                        /* First packet of a discontinuity region: an offset
+                         * stored meanwhile (by another playlist if shared) is
+                         * reused, else the region continues the timeline at
+                         * the scheduled start of its first segment. A
+                         * subtitle playlist estimates it from its first cue
+                         * only until the audio/video playlists have stored
+                         * one (see read_subtitle_packet()). */
+                        int64_t offset = disc_offset_lookup(c, pls, pls->active_discontinuity_sequence);
+
+                        if (offset == AV_NOPTS_VALUE) {
+                            int64_t raw = av_rescale_q(pls->pkt->dts,
+                                                       get_timebase(pls), AV_TIME_BASE_Q);
+                            if (c->first_timestamp == AV_NOPTS_VALUE)
+                                offset = 0;
+                            else
+                                offset = av_sat_sub64(segment_start_time(c, pls,
+                                                      pls->discontinuity_start_seq_no), raw);
+                            disc_offset_store(c, pls, pls->active_discontinuity_sequence, offset);
+                            av_log(s, AV_LOG_VERBOSE, "Playlist %d: discontinuity sequence %"PRId64
+                                   " timestamp offset %"PRId64" us\n", pls->index,
+                                   pls->active_discontinuity_sequence, offset);
+                        }
+                        pls->discontinuity_offset = offset;
+                    }
+                    if (pls->has_discontinuity &&
+                        pls->discontinuity_offset != AV_NOPTS_VALUE &&
+                        pls->discontinuity_offset) {
+                        int64_t offset = av_rescale_q(pls->discontinuity_offset,
+                                                     AV_TIME_BASE_Q,
+                                                     get_timebase(pls));
+                        if (pls->pkt->dts != AV_NOPTS_VALUE)
+                            pls->pkt->dts = av_sat_add64(pls->pkt->dts, offset);
+                        if (pls->pkt->pts != AV_NOPTS_VALUE)
+                            pls->pkt->pts = av_sat_add64(pls->pkt->pts, offset);
+                    }
+
+                    if (pls->discontinuity_region_start &&
+                        pls->pkt->dts != AV_NOPTS_VALUE) {
+                        /* The first packet since the segment demuxer was
+                         * (re)started comes from segment
+                         * discontinuity_start_seq_no: it anchors the timeline
+                         * of the playlist unless an anchor has followed it
+                         * (bookkeeping only for a playlist without
+                         * discontinuities). */
+                        pls->discontinuity_region_start = 0;
+                        if (pls->timeline_time == AV_NOPTS_VALUE && !pls->is_subtitle) {
+                            pls->timeline_seq_no = pls->discontinuity_start_seq_no;
+                            pls->timeline_time   = av_rescale_q(pls->pkt->dts,
+                                                                get_timebase(pls), AV_TIME_BASE_Q);
+                        }
+                        if (pls->has_discontinuity)
+                            disc_offset_store(c, pls, pls->active_discontinuity_sequence,
+                                              pls->discontinuity_offset);
+                    }
+
                     if (pls->ts_offset == AV_NOPTS_VALUE &&
                         pls->pkt->dts    != AV_NOPTS_VALUE) {
                         int64_t seg_idx = pls->cur_seq_no - pls->start_seq_no;
                         int64_t ts = av_rescale_q(pls->pkt->dts,
                             get_timebase(pls), AV_TIME_BASE_Q);
 
-                        /* EVENT playlists preserve all segments from the start */
-                        if (pls->type == PLS_TYPE_EVENT)
+                        if (pls->has_discontinuity) {
+                            /* With discontinuities first_timestamp stands
+                             * for the first segment of the window for a live
+                             * window too (parse_playlist() moves it along as
+                             * segments expire, find_timestamp_in_playlist()
+                             * counts from there): count back from the first
+                             * segment of the region, cur_seq_no may be past
+                             * it already with small segments. */
+                            seg_idx = pls->discontinuity_start_seq_no - pls->start_seq_no;
+                            if (!pls->finished)
+                                for (int64_t k = 0; k < seg_idx && k < pls->n_segments; k++)
+                                    ts -= pls->segments[k]->duration;
+                        } else if (pls->type == PLS_TYPE_EVENT)
+                            /* EVENT playlists preserve all segments from the start */
                             for (int64_t k = 0; k < seg_idx && k < pls->n_segments; k++)
                                 ts -= pls->segments[k]->duration;
 
@@ -3047,6 +3510,10 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         }
 
         pls->last_seq_no = pls->cur_seq_no;
+
+        /* the seek restarted the segment demuxer, continue the timeline
+         * from the region of the segment seeked to */
+        discontinuity_select(c, pls, 1);
     }
 
     c->cur_timestamp = seek_timestamp;
