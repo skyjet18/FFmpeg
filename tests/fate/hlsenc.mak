@@ -85,6 +85,27 @@ FATE_HLSENC-$(call ALLYES, HLS_DEMUXER MPEGTS_MUXER MPEGTS_DEMUXER AEVALSRC_FILT
 fate-hls-list-size: tests/data/hls_list_size.m3u8
 fate-hls-list-size: CMD = framecrc -auto_conversion_filters -flags +bitexact -i $(TARGET_PATH)/tests/data/hls_list_size.m3u8 -vf setpts=N*23
 
+tests/data/hls_discontinuity.m3u8: TAG = GEN
+tests/data/hls_discontinuity.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
+	-f lavfi -i "testsrc2=size=64x64:rate=5:d=1" -map 0:v -c:v mpeg2video -g 1 -f mpegts \
+	-y $(TARGET_PATH)/tests/data/hls_discontinuity_0.ts 2>/dev/null
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
+	-f lavfi -i "testsrc2=size=64x64:rate=5:d=1" -map 0:v -c:v mpeg2video -g 1 -f mpegts \
+	-y $(TARGET_PATH)/tests/data/hls_discontinuity_1.ts 2>/dev/null
+	printf '%s\n' '#EXTM3U' '#EXT-X-VERSION:3' '#EXT-X-TARGETDURATION:1' \
+	'#EXT-X-MEDIA-SEQUENCE:10' '#EXT-X-DISCONTINUITY-SEQUENCE:7' \
+	'#EXTINF:1.0,' 'hls_discontinuity_0.ts' '#EXT-X-DISCONTINUITY' \
+	'#EXTINF:1.0,' 'hls_discontinuity_1.ts' '#EXT-X-ENDLIST' > $(TARGET_PATH)/$@
+
+FATE_HLSENC-$(call ALLYES, HLS_DEMUXER MPEGTS_MUXER MPEGTS_DEMUXER TESTSRC2_FILTER LAVFI_INDEV MPEG2VIDEO_ENCODER) += fate-hls-discontinuity
+fate-hls-discontinuity: tests/data/hls_discontinuity.m3u8
+fate-hls-discontinuity: CMD = framecrc -flags +bitexact -i $(TARGET_PATH)/tests/data/hls_discontinuity.m3u8 -c copy
+
+FATE_HLSENC-$(call ALLYES, HLS_DEMUXER MPEGTS_MUXER MPEGTS_DEMUXER TESTSRC2_FILTER LAVFI_INDEV MPEG2VIDEO_ENCODER) += fate-hls-discontinuity-seek
+fate-hls-discontinuity-seek: tests/data/hls_discontinuity.m3u8
+fate-hls-discontinuity-seek: CMD = framecrc -flags +bitexact -ss 1.2 -i $(TARGET_PATH)/tests/data/hls_discontinuity.m3u8 -t 0.4 -c copy
+
 tests/data/hls_fmp4.m3u8: TAG = GEN
 tests/data/hls_fmp4.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
 	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \

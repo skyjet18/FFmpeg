@@ -75,8 +75,10 @@ enum KeyType {
 
 struct segment {
     int64_t duration;
+    int64_t discontinuity_sequence;
     int64_t url_offset;
     int64_t size;
+    int discontinuity;
     char *url;
     char *key;
     enum KeyType key_type;
@@ -104,6 +106,7 @@ struct playlist {
     uint8_t* read_buffer;
     AVIOContext *input;
     int input_read_done;
+    int discontinuity_pending;
     AVIOContext *input_next;
     int input_next_requested;
     AVFormatContext *parent;
@@ -129,6 +132,9 @@ struct playlist {
     int broken;
     int64_t cur_seq_no;
     int64_t last_seq_no;
+    int64_t active_discontinuity_sequence;
+    int64_t discontinuity_start_seq_no;
+    int64_t discontinuity_offset;
     int m3u8_hold_counters;
     int64_t cur_seg_offset;
     int64_t last_load_time;
@@ -349,6 +355,7 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
         return NULL;
     }
     pls->seek_timestamp = AV_NOPTS_VALUE;
+    pls->discontinuity_offset = 0;
 
     pls->is_subtitle = 0;
 
@@ -817,6 +824,10 @@ static int parse_playlist(HLSContext *c, const char *url,
     struct segment **prev_segments = NULL;
     int prev_n_segments = 0;
     int64_t prev_start_seq_no = -1;
+    int64_t discontinuity_sequence = 0;
+    int discontinuity = 0;
+    int discontinuity_sequence_seen = 0;
+    int segment_seen = 0;
 
     if (is_http && !in && c->http_persistent && c->playlist_pb) {
         in = c->playlist_pb;
@@ -922,6 +933,24 @@ static int parse_playlist(HLSContext *c, const char *url,
                 seq_no &= INT64_MAX/2;
             }
             pls->start_seq_no = seq_no;
+        } else if (av_strstart(line, "#EXT-X-DISCONTINUITY-SEQUENCE:", &ptr)) {
+            char *end;
+            uint64_t seq_no;
+
+            if (segment_seen || discontinuity || discontinuity_sequence_seen) {
+                ret = AVERROR_INVALIDDATA;
+                goto fail;
+            }
+            ret = ensure_playlist(c, &pls, url);
+            if (ret < 0)
+                goto fail;
+            seq_no = strtoull(ptr, &end, 10);
+            if (end == ptr || *end || seq_no > INT64_MAX) {
+                ret = AVERROR_INVALIDDATA;
+                goto fail;
+            }
+            discontinuity_sequence = seq_no;
+            discontinuity_sequence_seen = 1;
         } else if (av_strstart(line, "#EXT-X-PLAYLIST-TYPE:", &ptr)) {
             ret = ensure_playlist(c, &pls, url);
             if (ret < 0)
@@ -988,6 +1017,16 @@ static int parse_playlist(HLSContext *c, const char *url,
                                                 "invalid, it will be ignored");
                 continue;
             }
+        } else if (av_strstart(line, "#EXT-X-DISCONTINUITY", &ptr)) {
+            ret = ensure_playlist(c, &pls, url);
+            if (ret < 0)
+                goto fail;
+            if (discontinuity_sequence == INT64_MAX) {
+                ret = AVERROR_INVALIDDATA;
+                goto fail;
+            }
+            discontinuity_sequence++;
+            discontinuity = 1;
         } else if (av_strstart(line, "#EXT-X-ENDLIST", &ptr)) {
             if (pls)
                 pls->finished = 1;
@@ -1084,9 +1123,13 @@ static int parse_playlist(HLSContext *c, const char *url,
                     duration = 0.001 * AV_TIME_BASE;
                 }
                 seg->duration = duration;
+                seg->discontinuity_sequence = discontinuity_sequence;
+                seg->discontinuity = discontinuity;
                 seg->key_type = key_type;
                 dynarray_add(&pls->segments, &pls->n_segments, seg);
                 is_segment = 0;
+                discontinuity = 0;
+                segment_seen = 1;
 
                 seg->size = seg_size;
                 if (seg_size >= 0) {
@@ -1691,6 +1734,11 @@ restart:
 //    if (!v->input) {
         v->input_read_done = 0;
         seg = current_segment(v);
+        if (seg->discontinuity_sequence != v->active_discontinuity_sequence) {
+            v->active_discontinuity_sequence = seg->discontinuity_sequence;
+            v->discontinuity_pending = 1;
+            return AVERROR_EOF;
+        }
 
         /* load/update Media Initialization Section, if any */
         ret = update_init_section(v, seg);
@@ -1737,7 +1785,8 @@ restart:
 
     seg = next_segment(v);
     if (c->http_multiple == 1 && !v->input_next_requested &&
-        seg && seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL)) {
+        seg && !seg->discontinuity &&
+        seg->key_type == KEY_NONE && av_strstart(seg->url, "http", NULL)) {
         ret = open_input(c, v, seg, &v->input_next);
         if (ret < 0) {
             if (ff_check_interrupt(c->interrupt_callback))
@@ -1778,6 +1827,15 @@ restart:
     v->cur_seq_no++;
     c->cur_seq_no = v->cur_seq_no;
 
+    seg = current_segment(v);
+    if (seg && seg->discontinuity) {
+        ff_format_io_close(v->parent, &v->input_next);
+        v->input_next_requested = 0;
+        v->active_discontinuity_sequence = seg->discontinuity_sequence;
+        v->discontinuity_pending = 1;
+        return AVERROR_EOF;
+    }
+
     goto restart;
 }
 
@@ -1806,6 +1864,17 @@ static int read_data_subtitle_segment(void *opaque, uint8_t *buf, int buf_size)
     }
 
     return read_from_url(v, seg, buf, buf_size);
+}
+
+static int64_t segment_start_time(struct playlist *pls, int64_t seq_no)
+{
+    int64_t duration = 0;
+    int64_t segment = seq_no - pls->start_seq_no;
+
+    for (int64_t i = 0; i < segment && i < pls->n_segments; i++)
+        duration = av_sat_add64(duration, pls->segments[i]->duration);
+
+    return duration;
 }
 
 static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
@@ -1987,14 +2056,10 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
     }
 
     if (!pls->finished && pls->type != PLS_TYPE_EVENT) {
-        if (!c->first_packet && /* we are doing a segment selection during playback */
-            c->cur_seq_no >= pls->start_seq_no &&
-            c->cur_seq_no < pls->start_seq_no + pls->n_segments)
-            /* While spec 3.4.3 says that we cannot assume anything about the
-             * content at the same sequence number on different playlists,
-             * in practice this seems to work and doing it otherwise would
-             * require us to download a segment to inspect its timestamps. */
-            return c->cur_seq_no;
+        if (!c->first_packet && c->cur_timestamp != AV_NOPTS_VALUE) {
+            find_timestamp_in_playlist(c, pls, c->cur_timestamp, &seq_no, NULL);
+            return seq_no;
+        }
 
         /* If this is a live stream, start live_start_index segments from the
          * start or end */
@@ -2162,7 +2227,6 @@ static int hls_read_header(AVFormatContext *s)
 {
     HLSContext *c = s->priv_data;
     int ret = 0, i;
-    int64_t highest_cur_seq_no = 0;
 
     c->ctx                = s;
     c->interrupt_callback = &s->interrupt_callback;
@@ -2240,7 +2304,7 @@ static int hls_read_header(AVFormatContext *s)
             continue;
 
         pls->cur_seq_no = select_cur_seq_no(c, pls);
-        highest_cur_seq_no = FFMAX(highest_cur_seq_no, pls->cur_seq_no);
+        pls->active_discontinuity_sequence = current_segment(pls)->discontinuity_sequence;
     }
 
     av_dict_set(&c->demuxer_opts, "prefer_hls_mpegts_pts", "1", 0);
@@ -2262,18 +2326,6 @@ static int hls_read_header(AVFormatContext *s)
         pls->index  = i;
         pls->needed = 1;
         pls->parent = s;
-
-        /*
-         * If this is a live stream and this playlist looks like it is one segment
-         * behind, try to sync it up so that every substream starts at the same
-         * time position (so e.g. avformat_find_stream_info() will see packets from
-         * all active streams within the first few seconds). This is not very generic,
-         * though, as the sequence numbers are technically independent.
-         */
-        if (!pls->finished && pls->cur_seq_no == highest_cur_seq_no - 1 &&
-            highest_cur_seq_no < pls->start_seq_no + pls->n_segments) {
-            pls->cur_seq_no = highest_cur_seq_no;
-        }
 
         pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
         if (!pls->read_buffer){
@@ -2469,6 +2521,8 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             pls->needed = 1;
             changed = 1;
             pls->cur_seq_no = select_cur_seq_no(c, pls);
+            pls->discontinuity_start_seq_no = pls->cur_seq_no;
+            pls->discontinuity_offset = AV_NOPTS_VALUE;
             pls->pb.pub.eof_reached = 0;
             if (c->cur_timestamp != AV_NOPTS_VALUE) {
                 /* catch up */
@@ -2558,6 +2612,22 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     ret = av_read_frame(pls->ctx, pls->pkt);
 
                 if (ret < 0) {
+                    if (pls->discontinuity_pending) {
+                        AVIOContext *pb = &pls->pb.pub;
+
+                        pls->discontinuity_pending = 0;
+                        pls->discontinuity_start_seq_no = pls->cur_seq_no;
+                        pls->discontinuity_offset = AV_NOPTS_VALUE;
+                        pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
+                        pls->id3_offset = -1;
+                        pb->eof_reached = 0;
+                        pb->buf_end = pb->buf_ptr = pb->buffer;
+                        pb->pos = 0;
+                        ff_read_frame_flush(pls->ctx);
+                        for (unsigned j = 0; j < pls->ctx->nb_streams; j++)
+                            ffstream(pls->ctx->streams[j])->pts_wrap_reference = AV_NOPTS_VALUE;
+                        continue;
+                    }
                     if (!avio_feof(&pls->pb.pub) && ret != AVERROR_EOF)
                         return ret;
                     break;
@@ -2566,6 +2636,28 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     if (pls->is_id3_timestamped && pls->pkt->stream_index == 0) {
                         /* audio elementary streams are id3 timestamped */
                         fill_timing_for_id3_timestamped_stream(pls);
+                    }
+
+                    if (pls->discontinuity_offset == AV_NOPTS_VALUE &&
+                        c->first_timestamp != AV_NOPTS_VALUE &&
+                        pls->pkt->dts != AV_NOPTS_VALUE) {
+                        int64_t raw_timestamp = av_rescale_q(pls->pkt->dts,
+                            get_timebase(pls), AV_TIME_BASE_Q);
+                        int64_t presentation_timestamp = av_sat_add64(c->first_timestamp,
+                            segment_start_time(pls, pls->discontinuity_start_seq_no));
+
+                        pls->discontinuity_offset = av_sat_sub64(presentation_timestamp,
+                                                                 raw_timestamp);
+                    }
+                    if (pls->discontinuity_offset != AV_NOPTS_VALUE &&
+                        pls->discontinuity_offset) {
+                        int64_t offset = av_rescale_q(pls->discontinuity_offset,
+                                                     AV_TIME_BASE_Q,
+                                                     get_timebase(pls));
+                        if (pls->pkt->dts != AV_NOPTS_VALUE)
+                            pls->pkt->dts = av_sat_add64(pls->pkt->dts, offset);
+                        if (pls->pkt->pts != AV_NOPTS_VALUE)
+                            pls->pkt->pts = av_sat_add64(pls->pkt->pts, offset);
                     }
 
                     if (c->first_timestamp == AV_NOPTS_VALUE &&
@@ -2775,6 +2867,9 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
             pls->seek_stream_index = -1;
             pls->seek_flags |= AVSEEK_FLAG_ANY;
         }
+        pls->active_discontinuity_sequence = current_segment(pls)->discontinuity_sequence;
+        pls->discontinuity_start_seq_no = pls->cur_seq_no;
+        pls->discontinuity_offset = AV_NOPTS_VALUE;
     }
 
     c->cur_timestamp = seek_timestamp;
