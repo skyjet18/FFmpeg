@@ -1,6 +1,20 @@
 FATE_SAMPLES_DEMUX-$(call DEMDEC, AVI, FRAPS) += fate-avio-direct
 fate-avio-direct: CMD = framecrc -avioflags direct -i $(TARGET_SAMPLES)/fraps/fraps-v5-bouncing-balls-partial.avi -avioflags direct
 
+tests/data/dash-live-sync.mpd: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin -v error \
+		-f lavfi -i "testsrc2=size=32x32:rate=1:duration=6" \
+		-f lavfi -i "sine=frequency=1000:sample_rate=48000:duration=5" \
+		-c:v mpeg4 -g 1 -c:a aac -f dash -seg_duration 1 -use_template 1 -use_timeline 1 \
+		-init_seg_name 'dash-live-sync-init-$$RepresentationID$$.m4s' \
+		-media_seg_name 'dash-live-sync-chunk-$$RepresentationID$$-$$Number%05d$$.m4s' \
+		$(TARGET_PATH)/$@
+	$(M)sed -i 's/type="static"/type="dynamic"/; /mediaPresentationDuration=/d' $(TARGET_PATH)/$@
+
+FATE_FFPROBE_DEMUX-$(call ALLYES, DASH_DEMUXER DASH_MUXER MOV_DEMUXER MPEG4_ENCODER AAC_ENCODER LAVFI_INDEV TESTSRC2_FILTER SINE_FILTER) += fate-dash-live-sync
+fate-dash-live-sync: tests/data/dash-live-sync.mpd
+fate-dash-live-sync: CMD = run ffprobe$(PROGSSUF)$(EXESUF) -v warning -read_intervals "%+\#8" -show_entries packet=stream_index,pts_time -of compact=p=0:nk=0 $(TARGET_PATH)/tests/data/dash-live-sync.mpd
+
 FATE_SAMPLES_DEMUX-$(call DEMDEC, AAC, AAC) += fate-adts-demux fate-adts-id3v1-demux fate-adts-id3v2-demux fate-adts-id3v2-two-tags-demux
 fate-adts-demux: CMD = crc -i $(TARGET_SAMPLES)/aac/ct_faac-adts.aac -c:a copy
 fate-adts-id3v1-demux: CMD = framecrc -f aac -i $(TARGET_SAMPLES)/aac/id3v1.aac -c:a copy

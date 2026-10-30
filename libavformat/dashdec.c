@@ -171,6 +171,7 @@ typedef struct DASHContext {
 
     uint64_t playlist_load_time;
     int fake_last_subtitle;
+    int64_t shared_first_pts; /* common live-timeline origin in AV_TIME_BASE units */
 } DASHContext;
 
 static int ishttp(char *url)
@@ -2217,6 +2218,8 @@ static int dash_read_header(AVFormatContext *s)
     if ((ret = parse_manifest(s, s->url, s->pb)) < 0)
         return ret;
 
+    c->shared_first_pts = INT64_MIN;
+
     /* If this isn't a live stream, fill the total duration of the
      * stream. */
     if (!c->is_live) {
@@ -2394,15 +2397,36 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
         if (ret >= 0) {
             if(cur->n_fragments != 1)
             {
-                /* in multifragments mode - ensure, that PTS always starts from 0 */
-                if(cur->first_pts == INT64_MIN)
-                {
-                    av_log(c, AV_LOG_TRACE, "Setting first PTS to pos[%" PRId64 "] for %s\n", cur->first_pts, cur->id);
-                    cur->first_pts = pkt->pts;
+                int64_t packet_pts = pkt->pts != AV_NOPTS_VALUE ? pkt->pts : pkt->dts;
+
+                if (cur->first_pts == INT64_MIN && packet_pts != AV_NOPTS_VALUE) {
+                    av_log(c, AV_LOG_TRACE, "Setting first PTS to pos[%" PRId64 "] for %s\n", packet_pts, cur->id);
+                    cur->first_pts = packet_pts;
                 }
 
-                pkt->pts -= cur->first_pts;
-                pkt->dts -= cur->first_pts;
+                if (c->is_live && !c->is_startover && cur->n_timelines &&
+                    cur->type != AVMEDIA_TYPE_SUBTITLE) {
+                    AVStream *st = cur->ctx->streams[pkt->stream_index];
+
+                    if (c->shared_first_pts == INT64_MIN &&
+                        packet_pts != AV_NOPTS_VALUE)
+                        c->shared_first_pts = av_rescale_q(packet_pts, st->time_base,
+                                                          AV_TIME_BASE_Q);
+
+                    if (c->shared_first_pts != INT64_MIN) {
+                        int64_t offset = av_rescale_q(c->shared_first_pts,
+                                                      AV_TIME_BASE_Q, st->time_base);
+                        if (pkt->pts != AV_NOPTS_VALUE)
+                            pkt->pts -= offset;
+                        if (pkt->dts != AV_NOPTS_VALUE)
+                            pkt->dts -= offset;
+                    }
+                } else if (cur->first_pts != INT64_MIN) {
+                    if (pkt->pts != AV_NOPTS_VALUE)
+                        pkt->pts -= cur->first_pts;
+                    if (pkt->dts != AV_NOPTS_VALUE)
+                        pkt->dts -= cur->first_pts;
+                }
             }
 
             /* If we got a packet, return it */
