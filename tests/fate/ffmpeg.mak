@@ -41,6 +41,10 @@ fate-ffmpeg-filter_colorkey: CMD = framecrc -auto_conversion_filters -idct simpl
 FATE_FFMPEG-$(call FILTERFRAMECRC, COLOR) += fate-ffmpeg-lavfi
 fate-ffmpeg-lavfi: CMD = framecrc -lavfi color=d=1:r=5 -fflags +bitexact
 
+FATE_FFMPEG-$(call ALLYES, SINE_FILTER LAVFI_INDEV PCM_S16LE_DECODER PCM_S16LE_ENCODER NULL_MUXER PIPE_PROTOCOL) += fate-ffmpeg-codec-stream-specifier
+fate-ffmpeg-codec-stream-specifier: CMD = ffmpeg -v error -f lavfi -i "sine=d=0.01" -c:a invalid -c:a:pcm_s16le pcm_s16le -f null -
+fate-ffmpeg-codec-stream-specifier: CMP = null
+
 FATE_SAMPLES_FFMPEG-$(call ENCDEC2, MPEG4, RAWVIDEO, AVI, RAWVIDEO_DEMUXER FRAMECRC_MUXER) += fate-force_key_frames
 fate-force_key_frames: tests/data/vsynth_lena.yuv
 fate-force_key_frames: CMD = enc_dec \

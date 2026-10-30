@@ -742,6 +742,7 @@ SKIPHEADERS-$(CONFIG_FFRTMPCRYPT_PROTOCOL) += rtmpdh.h
 SKIPHEADERS-$(CONFIG_NETWORK)            += network.h rtsp.h
 
 TESTPROGS = seek                                                        \
+            stream_specifier                                            \
             url                                                         \
             seek_utils
 #           async                                                       \

@@ -474,6 +474,7 @@ static int match_stream_specifier(const AVFormatContext *s, const AVStream *st,
             return match;
         } else if (*spec == 'v' || *spec == 'a' || *spec == 's' || *spec == 'd' ||
                    *spec == 't' || *spec == 'V') { /* opt:[vasdtV] */
+            const AVCodecDescriptor *desc = NULL;
             enum AVMediaType type;
             int nopic = 0;
 
@@ -486,12 +487,28 @@ static int match_stream_specifier(const AVFormatContext *s, const AVStream *st,
             case 'V': type = AVMEDIA_TYPE_VIDEO; nopic = 1; break;
             default:  av_assert0(0);
             }
-            if (*spec && *spec++ != ':')         /* If we are not at the end, then another specifier must follow. */
-                return AVERROR(EINVAL);
+            if (*spec) {
+                const char *next;
+                char *codec_name;
+
+                if (*spec++ != ':')              /* If we are not at the end, then another specifier must follow. */
+                    return AVERROR(EINVAL);
+
+                next = strchr(spec, ':');
+                codec_name = av_strndup(spec, next ? next - spec : strlen(spec));
+                if (!codec_name)
+                    return AVERROR(ENOMEM);
+                desc = avcodec_descriptor_get_by_name(codec_name);
+                av_free(codec_name);
+                if (desc)
+                    spec = next ? next + 1 : spec + strlen(spec);
+            }
 
             if (type != st->codecpar->codec_type)
                 match = 0;
             if (nopic && (st->disposition & AV_DISPOSITION_ATTACHED_PIC))
+                match = 0;
+            if (desc && desc->id != st->codecpar->codec_id)
                 match = 0;
         } else if (*spec == 'p' && *(spec + 1) == ':') {
             int prog_id;

@@ -31,6 +31,11 @@ fate-seek_utils: libavformat/tests/seek_utils$(EXESUF)
 fate-seek_utils: CMD = run libavformat/tests/seek_utils$(EXESUF)
 fate-seek_utils: CMP = null
 
+FATE_LIBAVFORMAT += fate-stream-specifier
+fate-stream-specifier: libavformat/tests/stream_specifier$(EXESUF)
+fate-stream-specifier: CMD = run libavformat/tests/stream_specifier$(EXESUF)
+fate-stream-specifier: CMP = null
+
 FATE_LIBAVFORMAT += $(FATE_LIBAVFORMAT-yes)
 FATE-$(CONFIG_AVFORMAT) += $(FATE_LIBAVFORMAT)
 fate-libavformat: $(FATE_LIBAVFORMAT)
