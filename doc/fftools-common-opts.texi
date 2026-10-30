@@ -40,14 +40,24 @@ additional stream specifier (see below), then it selects stream number
 order of the streams as detected by libavformat except when a program ID is
 also specified. In this case it is based on the ordering of the streams in the
 program.
-@item @var{stream_type}[:@var{additional_stream_specifier}]
+@item @var{stream_type}[:@var{codec_name}][:@var{additional_stream_specifier}]
 @var{stream_type} is one of following: 'v' or 'V' for video, 'a' for audio, 's'
 for subtitle, 'd' for data, and 't' for attachments. 'v' matches all video
 streams, 'V' only matches video streams which are not attached pictures, video
-thumbnails or cover arts. If @var{additional_stream_specifier} is used, then
-it matches streams which both have this type and match the
-@var{additional_stream_specifier}. Otherwise, it matches all streams of the
-specified type.
+thumbnails or cover arts.
+
+If @var{codec_name} is present, it must be the canonical name of a codec, such
+as @code{aac} or @code{h264}, and matches streams which have both the specified
+type and codec. For mapped output streams, the codec name refers to the input
+codec. Codec-name matching is not available for output streams created by a
+complex filtergraph, because decoded filter output has no input codec.
+
+If @var{additional_stream_specifier} is used, then it matches streams which
+have this type and codec, when specified, and also match the
+@var{additional_stream_specifier}. For example, @code{a:aac} matches all AAC
+audio streams and @code{a:aac:1} matches the second AAC audio stream. A token
+following @var{stream_type} which is not a recognized codec name is interpreted
+as an @var{additional_stream_specifier}, preserving forms such as @code{a:1}.
 @item p:@var{program_id}[:@var{additional_stream_specifier}]
 Matches streams which are in the program with the id @var{program_id}. If
 @var{additional_stream_specifier} is used, then it matches streams which both

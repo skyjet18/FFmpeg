@@ -1163,6 +1163,8 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
     ost->kf.ref_pts = AV_NOPTS_VALUE;
     ost->par_in->codec_type  = type;
     st->codecpar->codec_type = type;
+    if (ist)
+        st->codecpar->codec_id = ist->par->codec_id;
 
     ret = choose_encoder(o, oc, ost, &enc);
     if (ret < 0) {
