@@ -1964,9 +1964,11 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
         /* disable seeking for subtitles - subtitles are small and many servers doesn't support byterange for subtitles */
         av_dict_set(&opts, "seekable", "0", 0);
     }
-    else if(seg->seekable)
+    else if(seg->seekable || seg->size >= 0)
     {
-        /* single big segment - allow seeking and reconnect if needed */
+        /* single big segment or byte range segment (several segments share
+         * one file) - allow seeking and reconnect if needed, more robust when
+         * the connection breaks in the middle of a range request */
         av_dict_set(&opts, "seekable", "1", 0);
         av_dict_set(&opts, "reconnect", "1", 0);
     }
