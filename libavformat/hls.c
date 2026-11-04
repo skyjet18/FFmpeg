@@ -1440,6 +1440,7 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
 {
     AVIOContext *pb = NULL;
     char *key_url = NULL;
+    int ret;
 
     if (!strncmp(seg->key, "key://", 6)) {
         /* the key is given directly as hex string */
@@ -1459,14 +1460,18 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
         return 0;
     }
 
-    if (NULL != c->key_uri_replace_old && \
-		NULL != c-> key_uri_replace_new && \
-		'\0' != c->key_uri_replace_old[0]) {
-		key_url = av_strireplace(seg->key, c->key_uri_replace_old, c->key_uri_replace_new);
+    if (c->key_uri_replace_old && c->key_uri_replace_new &&
+        c->key_uri_replace_old[0]) {
+        key_url = av_strireplace(seg->key, c->key_uri_replace_old, c->key_uri_replace_new);
+        if (!key_url)
+            return AVERROR(ENOMEM);
     } else {
-		key_url = seg->key;
+        key_url = seg->key;
     }
-    int ret = open_url(pls->parent, &pb, key_url, &c->avio_opts, NULL, NULL);
+
+    ret = open_url(pls->parent, &pb, key_url, &c->avio_opts, NULL, NULL);
+    if (key_url != seg->key)
+        av_free(key_url);
     if (ret < 0) {
         av_log(pls->parent, AV_LOG_ERROR, "Unable to open key file %s, %s\n",
                seg->key, av_err2str(ret));
@@ -1489,8 +1494,6 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
     }
 
     av_strlcpy(pls->key_url, seg->key, sizeof(pls->key_url));
-    if (key_url != seg->key)
-    		av_free(key_url);
 
     return 0;
 }
