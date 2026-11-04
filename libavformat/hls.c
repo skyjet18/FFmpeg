@@ -1441,6 +1441,24 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
     AVIOContext *pb = NULL;
     char *key_url = NULL;
 
+    if (!strncmp(seg->key, "key://", 6)) {
+        /* the key is given directly as hex string */
+        if (strlen(seg->key + 6) != sizeof(pls->key) * 2)
+            av_log(pls->parent, AV_LOG_ERROR, "Failed to parse key %s - wrong key length\n",
+                   seg->key + 6);
+        else
+            ff_hex_to_data(pls->key, seg->key + 6);
+        av_strlcpy(pls->key_url, seg->key, sizeof(pls->key_url));
+        return 0;
+    }
+
+    if (!strncmp(seg->key, "keys://", 7)) {
+        /* "keys://" contains multiple kid=key pairs, they are passed to the
+         * mov demuxer as decryption_keys in hls_read_header() */
+        av_strlcpy(pls->key_url, seg->key, sizeof(pls->key_url));
+        return 0;
+    }
+
     if (NULL != c->key_uri_replace_old && \
 		NULL != c-> key_uri_replace_new && \
 		'\0' != c->key_uri_replace_old[0]) {
@@ -2495,9 +2513,14 @@ static int hls_read_header(AVFormatContext *s)
         seg = current_segment(pls);
         if (seg && seg->key_type == KEY_SAMPLE_AES) {
             if (strstr(in_fmt->name, "mov")) {
-                char key[33];
-                ff_data_to_hex(key, pls->key, sizeof(pls->key), 0);
-                av_dict_set(&options, "decryption_key", key, 0);
+                if (!strncmp(pls->key_url, "keys://", 7)) {
+                    /* special URL with encoded kid=key pairs */
+                    av_dict_set(&options, "decryption_keys", pls->key_url + 7, 0);
+                } else {
+                    char key[33];
+                    ff_data_to_hex(key, pls->key, sizeof(pls->key), 0);
+                    av_dict_set(&options, "decryption_key", key, 0);
+                }
             } else if (!c->crypto_ctx.aes_ctx) {
                 c->crypto_ctx.aes_ctx = av_aes_alloc();
                 if (!c->crypto_ctx.aes_ctx) {
