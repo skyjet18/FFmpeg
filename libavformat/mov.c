@@ -8342,7 +8342,11 @@ static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, AVEncryptionIn
     }
 
     if (!c->decryption_keys) {
-        av_assert0(c->decryption_default_key);
+        if (!c->decryption_default_key) {
+            /* possible when only decryption_video_key/decryption_audio_key is set */
+            av_log(c->fc, AV_LOG_ERROR, "no decryption key for this stream\n");
+            return AVERROR_INVALIDDATA;
+        }
         memcpy(out, c->decryption_default_key, len);
         av_log(c->fc, AV_LOG_DEBUG, "Returning default decryption key\n");
         return 0;
@@ -8381,11 +8385,45 @@ static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
     int i, ret;
     int bytes_of_protected_data;
     uint8_t decryption_key[AES_CTR_KEY_SIZE];
+    AVStream *st = NULL;
+    int have_stream_key = 0;
 
     if (!sc->cenc.aes_ctr) {
-        ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sample);
-        if (ret < 0) {
-            return ret;
+        if (sc->ffindex >= 0 && sc->ffindex < c->fc->nb_streams)
+            st = c->fc->streams[sc->ffindex];
+
+        if (st && st->codecpar) {
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                c->decryption_video_key) {
+
+                if (c->decryption_video_key_len != AES_CTR_KEY_SIZE) {
+                    av_log(c->fc, AV_LOG_ERROR,
+                           "invalid video decryption key length: got %d, expected %d\n",
+                           c->decryption_video_key_len, AES_CTR_KEY_SIZE);
+                    return AVERROR_INVALIDDATA;
+                }
+                memcpy(decryption_key, c->decryption_video_key, AES_CTR_KEY_SIZE);
+                have_stream_key = 1;
+
+            } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO &&
+                       c->decryption_audio_key) {
+
+                if (c->decryption_audio_key_len != AES_CTR_KEY_SIZE) {
+                    av_log(c->fc, AV_LOG_ERROR,
+                           "invalid audio decryption key length: got %d, expected %d\n",
+                           c->decryption_audio_key_len, AES_CTR_KEY_SIZE);
+                    return AVERROR_INVALIDDATA;
+                }
+                memcpy(decryption_key, c->decryption_audio_key, AES_CTR_KEY_SIZE);
+                have_stream_key = 1;
+            }
+        }
+
+        if (!have_stream_key) {
+            ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sample);
+            if (ret < 0) {
+                return ret;
+            }
         }
 
         /* initialize the cipher */
@@ -8738,7 +8776,7 @@ static int cenc_filter(MOVContext *mov, AVStream* st, MOVStreamContext *sc, AVPa
             return AVERROR_INVALIDDATA;
         }
 
-        if (mov->decryption_keys || mov->decryption_default_key) {
+        if (mov->decryption_keys || mov->decryption_default_key || mov->decryption_video_key || mov->decryption_audio_key) {
             return cenc_decrypt(mov, sc, encrypted_sample, pkt->data, pkt->size);
         } else {
             size_t size;
@@ -11290,6 +11328,18 @@ static int mov_read_header(AVFormatContext *s)
     MOVAtom atom = { AV_RL32("root") };
     int i;
 
+    if (mov->decryption_video_key_len != 0 && mov->decryption_video_key_len != AES_CTR_KEY_SIZE) {
+        av_log(s, AV_LOG_ERROR, "Invalid decryption video key len %d expected %d\n",
+            mov->decryption_video_key_len, AES_CTR_KEY_SIZE);
+        return AVERROR(EINVAL);
+    }
+
+    if (mov->decryption_audio_key_len != 0 && mov->decryption_audio_key_len != AES_CTR_KEY_SIZE) {
+        av_log(s, AV_LOG_ERROR, "Invalid decryption audio key len %d expected %d\n",
+            mov->decryption_audio_key_len, AES_CTR_KEY_SIZE);
+        return AVERROR(EINVAL);
+    }
+
     mov->fc = s;
     mov->trak_index = -1;
     mov->primary_item_id = -1;
@@ -12201,6 +12251,8 @@ static const AVOption mov_options[] = {
         .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "decryption_key", "The default media decryption key (hex)", OFFSET(decryption_default_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "decryption_keys", "The media decryption keys by KID (hex)", OFFSET(decryption_keys), AV_OPT_TYPE_DICT, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "decryption_video_key", "The media decryption video key (hex)", OFFSET(decryption_video_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "decryption_audio_key", "The media decryption audio key (hex)", OFFSET(decryption_audio_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "enable_drefs", "Enable external track support.", OFFSET(enable_drefs), AV_OPT_TYPE_BOOL,
         {.i64 = 0}, 0, 1, FLAGS },
     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
