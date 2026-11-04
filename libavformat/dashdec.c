@@ -123,6 +123,7 @@ struct representation {
     uint32_t init_sec_data_len;
     uint32_t init_sec_buf_read_offset;
     int64_t cur_timestamp;
+    int64_t first_pts;
     int is_restart_needed;
 
     char *cenc_decryption_key;
@@ -968,6 +969,7 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
 
     rep->parent = s;
     rep->type = type;
+    rep->first_pts = INT64_MIN;
     representation_segmenttemplate_node = find_child_node_by_name(representation_node, "SegmentTemplate");
     representation_baseurl_node = find_child_node_by_name(representation_node, "BaseURL");
     representation_segmentlist_node = find_child_node_by_name(representation_node, "SegmentList");
@@ -2551,6 +2553,23 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
     while (!ff_check_interrupt(c->interrupt_callback) && !ret) {
         ret = av_read_frame(cur->ctx, pkt);
         if (ret >= 0) {
+            if(cur->n_fragments != 1)
+            {
+                /* in multifragments mode - ensure, that PTS always starts from 0 */
+                if(cur->first_pts == INT64_MIN && pkt->pts != AV_NOPTS_VALUE)
+                {
+                    av_log(c, AV_LOG_TRACE, "Setting first PTS to pos[%" PRId64 "] for %s\n", pkt->pts, cur->id);
+                    cur->first_pts = pkt->pts;
+                }
+
+                if (cur->first_pts != INT64_MIN) {
+                    if (pkt->pts != AV_NOPTS_VALUE)
+                        pkt->pts -= cur->first_pts;
+                    if (pkt->dts != AV_NOPTS_VALUE)
+                        pkt->dts -= cur->first_pts;
+                }
+            }
+
             /* If we got a packet, return it */
             cur->cur_timestamp = av_rescale(pkt->pts, (int64_t)cur->ctx->streams[0]->time_base.num * 90000, cur->ctx->streams[0]->time_base.den);
             pkt->stream_index += cur->stream_index;
@@ -2611,6 +2630,11 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
     // find the nearest fragment
     if (pls->n_timelines > 0 && pls->fragment_timescale > 0) {
         int64_t num = pls->first_seq_no;
+        /* first_pts is in the time base of the inner demuxer's stream */
+        if (pls->first_pts != INT64_MIN && pls->ctx && pls->ctx->nb_streams > 0)
+            seek_pos_msec += av_rescale_q(pls->first_pts, pls->ctx->streams[0]->time_base,
+                                          (AVRational){ 1, 1000 });
+
         av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline start n_timelines[%d] "
                "last_seq_no[%"PRId64"].\n",
                (int)pls->n_timelines, (int64_t)pls->last_seq_no);
