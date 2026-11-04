@@ -470,7 +470,7 @@ typedef struct AACDecDSP {
     void (*apply_intensity_stereo)(AACDecContext *ac, ChannelElement *cpe,
                                    int ms_present);
 
-    void (*apply_tns)(void *_coef_param, TemporalNoiseShaping *tns,
+    __attribute__((optimize(0))) void (*apply_tns)(void *_coef_param, TemporalNoiseShaping *tns,
                       IndividualChannelStream *ics, int decode);
 
     void (*apply_ltp)(AACDecContext *ac, SingleChannelElement *sce);
