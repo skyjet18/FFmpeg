@@ -1742,6 +1742,35 @@ reload:
                    v->start_seq_no - v->cur_seq_no);
             v->cur_seq_no = v->start_seq_no;
         }
+        /* Media sequence wrap after server side ad insertion: going back
+         * from the ad to the programme, some servers restart the media
+         * sequence (e.g. from 325 to 31). cur_seq_no is then far AHEAD of the
+         * new playlist window, not behind it, so the branch above does not
+         * catch it, and the segment would be waited for up to max_reload
+         * times although it never comes. Regular live HLS never gets here:
+         * cur_seq_no is at most one segment past the window.
+         *
+         * The target is not start_seq_no (the oldest segment of the new
+         * window) but one segment before the live edge
+         * (start_seq_no + n_segments - 2). Right at the edge (n_segments - 1)
+         * the picture stalled for a few seconds after every resync, the
+         * decoder had no data in reserve; n_segments - 3, after FFmpeg's
+         * live_start_index default for a cold start, jumped back three
+         * segments (15 s with 5 s segments) for no reason, as the player
+         * still has data buffered.
+         *
+         * The +6 segments of tolerance keep a lagging CDN edge (a playlist a
+         * segment or two behind) from triggering it; a real wrap is far
+         * outside the window anyway. Tested live on 2026-10-25. */
+        else if (v->n_segments > 0 &&
+                 v->cur_seq_no > v->start_seq_no + v->n_segments + 6) {
+            int64_t target_seq_no = v->start_seq_no + FFMAX(v->n_segments - 2, 0);
+            av_log(v->parent, AV_LOG_WARNING,
+                   "cur_seq_no %"PRId64" is far beyond playlist window [%"PRId64" - %"PRId64"], resyncing to live edge (seq %"PRId64")\n",
+                   v->cur_seq_no, v->start_seq_no, v->start_seq_no + v->n_segments - 1, target_seq_no);
+            v->cur_seq_no = target_seq_no;
+            v->last_seq_no = target_seq_no - 1;
+        }
         if (v->cur_seq_no > v->last_seq_no) {
             v->last_seq_no = v->cur_seq_no;
             v->m3u8_hold_counters = 0;
