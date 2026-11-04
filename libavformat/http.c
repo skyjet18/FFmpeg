@@ -2221,12 +2221,21 @@ static int http_get_short_seek(URLContext *h)
     return ffurl_get_short_seek(s->hd);
 }
 
+/* Expose the underlying connection (e.g. tls) as child, so that its
+ * options (e.g. tls_verify) can be read with AV_OPT_SEARCH_CHILDREN. */
+static void *http_child_next(void *obj, void *prev)
+{
+    HTTPContext *s = obj;
+    return prev ? NULL : s->hd;
+}
+
 #define HTTP_CLASS(flavor)                          \
 static const AVClass flavor ## _context_class = {   \
     .class_name = # flavor,                         \
     .item_name  = av_default_item_name,             \
     .option     = http_options,                     \
     .version    = LIBAVUTIL_VERSION_INT,            \
+    .child_next = http_child_next,                  \
 }
 
 #if CONFIG_HTTP_PROTOCOL
