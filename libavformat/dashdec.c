@@ -1877,6 +1877,28 @@ static void move_segments(struct representation *rep_src, struct representation 
 }
 
 
+/* Position of a representation after a manifest reload (SegmentTimeline).
+ * cur_seq_no is an absolute segment number (first_seq_no + index).
+ * $Number$ templates: the number stays valid, keep it; falling out of the
+ * window is handled later in get_current_fragment().
+ * Other templates: map via media time, old segment -> time -> new segment.
+ * In 9.0.2 get_segment_start_time_based_on_timeline() takes and
+ * calc_next_seg_no_from_timelines() returns absolute segment numbers. */
+static int64_t refreshed_seq_no(DASHContext *c, struct representation *old, struct representation *neu)
+{
+    int64_t seq_no, t;
+
+    if (old->url_template && av_stristr(old->url_template, "$Number"))
+        return old->cur_seq_no;
+
+    seq_no = FFMAX(old->cur_seq_no, old->first_seq_no);
+    t = get_segment_start_time_based_on_timeline(old, seq_no);
+    seq_no = calc_next_seg_no_from_timelines(neu, t - 1);
+    if (seq_no < 0) /* not published yet: the next segment after the new timeline */
+        seq_no = calc_max_seg_no(neu, c) + 1;
+    return seq_no;
+}
+
 static int refresh_manifest(AVFormatContext *s)
 {
     int ret = 0, i;
@@ -1936,19 +1958,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_video = videos[i];
         struct representation *ccur_video = c->videos[i];
         if (cur_video->timelines && cur_video->fragment_timescale > 0) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_video, cur_video->cur_seq_no) / cur_video->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_video, currentTime * cur_video->fragment_timescale - 1);
-
-            // update segments
-            if( cur_video->cur_seq_no > next_seg_no || cur_video->cur_seq_no < calc_min_seg_no(s, ccur_video) )
-            {
-                ccur_video->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_video->cur_seq_no = cur_video->cur_seq_no;
-            }
+            ccur_video->cur_seq_no = refreshed_seq_no(c, cur_video, ccur_video);
 
             if (ccur_video->cur_seq_no >= 0) {
                 move_timelines(ccur_video, cur_video, c);
@@ -1962,19 +1972,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_audio = audios[i];
         struct representation *ccur_audio = c->audios[i];
         if (cur_audio->timelines && cur_audio->fragment_timescale > 0) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_audio, cur_audio->cur_seq_no) / cur_audio->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_audio, currentTime * cur_audio->fragment_timescale - 1);
-
-            // update segments
-            if( cur_audio->cur_seq_no > next_seg_no || cur_audio->cur_seq_no < calc_min_seg_no(s, ccur_audio))
-            {
-                ccur_audio->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_audio->cur_seq_no = cur_audio->cur_seq_no;
-            }
+            ccur_audio->cur_seq_no = refreshed_seq_no(c, cur_audio, ccur_audio);
 
             if (ccur_audio->cur_seq_no >= 0) {
                 move_timelines(ccur_audio, cur_audio, c);
@@ -1989,19 +1987,7 @@ static int refresh_manifest(AVFormatContext *s)
         struct representation *cur_subtitle = subtitles[i];
         struct representation *ccur_subtitle = c->subtitles[i];
         if (cur_subtitle->timelines && cur_subtitle->fragment_timescale > 0) {
-            // calc current time
-            int64_t currentTime = get_segment_start_time_based_on_timeline(cur_subtitle, cur_subtitle->cur_seq_no) / cur_subtitle->fragment_timescale;
-            int64_t next_seg_no = calc_next_seg_no_from_timelines(ccur_subtitle, currentTime * cur_subtitle->fragment_timescale - 1);
-
-            // update segments
-            if( cur_subtitle->cur_seq_no > next_seg_no || cur_subtitle->cur_seq_no < calc_min_seg_no(s, ccur_subtitle))
-            {
-                ccur_subtitle->cur_seq_no = next_seg_no;
-            }
-            else
-            {
-                ccur_subtitle->cur_seq_no = cur_subtitle->cur_seq_no;
-            }
+            ccur_subtitle->cur_seq_no = refreshed_seq_no(c, cur_subtitle, ccur_subtitle);
 
             if (ccur_subtitle->cur_seq_no >= 0) {
                 move_timelines(ccur_subtitle, cur_subtitle, c);
