@@ -172,6 +172,7 @@ typedef struct DASHContext {
     int is_init_section_common_audio;
     int is_init_section_common_subtitle;
 
+    uint64_t playlist_load_time;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -1354,6 +1355,7 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
         if (ret == 0)
             ret = AVERROR_INVALIDDATA;
     } else {
+        c->playlist_load_time = get_current_time_in_sec();
         LIBXML_TEST_VERSION
 
         doc = xmlReadMemory(buf.str, buf.len, c->base_url, NULL, 0);
@@ -1608,6 +1610,16 @@ static int refresh_manifest(AVFormatContext *s)
     struct representation **subtitles = c->subtitles;
     char *base_url = c->base_url;
 
+    uint64_t cur_time = get_current_time_in_sec();
+//    uint64_t publish_time = c->publish_time > 0 ? c->publish_time : c->playlist_load_time;
+    uint64_t publish_time = c->playlist_load_time;
+
+    if ( publish_time > 0 && (publish_time + c->minimum_update_period) >= cur_time) {
+        av_log(s, AV_LOG_TRACE, "Manifest refresh not needed - current one is still %"PRIu64"s valid\n", (publish_time + c->minimum_update_period) - cur_time);
+        /* > 0: manifest was not reloaded (callers counting reloads use this) */
+        return 1;
+    }
+
     c->base_url = NULL;
     c->n_videos = 0;
     c->videos = NULL;
@@ -1719,13 +1731,18 @@ static struct fragment *get_current_fragment(struct representation *pls)
             seg->url_offset = seg_ptr->url_offset;
             return seg;
         } else if (c->is_live) {
-            if (reload_count++ >= c->max_reload) {
+            if (reload_count >= c->max_reload) {
                 av_log(pls->parent, AV_LOG_ERROR,
                        "Reached max manifest reloads (%d) at seq %"PRId64"\n",
                        c->max_reload, pls->cur_seq_no);
                 return NULL;
             }
-            refresh_manifest(pls->parent);
+            if (refresh_manifest(pls->parent) > 0) {
+                /* manifest is still valid - wait instead of counting a reload */
+                av_usleep(100*1000);
+            } else {
+                reload_count++;
+            }
         } else {
             break;
         }
