@@ -2168,7 +2168,9 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
     ffio_init_context(&pls->pb, avio_ctx_buffer, INITIAL_BUFFER_SIZE, 0,
                       pls, read_data, NULL, c->is_live && !c->is_startover ? NULL : seek_data);
 
-    if(pls->type == AVMEDIA_TYPE_SUBTITLE || pls->n_timelines || pls->n_fragments > 1 || c->is_live)
+    /* a SegmentTemplate with a duration has neither timelines nor fragments,
+     * but many segments: only a single file is seekable */
+    if(pls->type == AVMEDIA_TYPE_SUBTITLE || pls->n_timelines || pls->n_fragments > 1 || pls->url_template || c->is_live)
     {
         pls->pb.pub.seekable = 0;
     }
