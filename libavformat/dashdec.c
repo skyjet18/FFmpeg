@@ -170,6 +170,10 @@ typedef struct DASHContext {
     char *cenc_decryption_keys;
     char *cenc_decryption_video_key;
     char *cenc_decryption_audio_key;
+    int audioRepIdx;
+    int videoRepIdx;
+    int audio_rep_index;
+    int video_rep_index;
 
     /* Flags for init section*/
     int is_init_section_common_video;
@@ -401,6 +405,7 @@ static void free_video_list(DASHContext *c)
     }
     av_freep(&c->videos);
     c->n_videos = 0;
+    c->videoRepIdx = 0;
 }
 
 static void free_audio_list(DASHContext *c)
@@ -412,6 +417,7 @@ static void free_audio_list(DASHContext *c)
     }
     av_freep(&c->audios);
     c->n_audios = 0;
+    c->audioRepIdx = 0;
 }
 
 static void free_subtitle_list(DASHContext *c)
@@ -1194,12 +1200,37 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
 
     switch (type) {
     case AVMEDIA_TYPE_VIDEO:
-        ret = av_dynarray_add_nofree(&c->videos, &c->n_videos, rep);
+        if((c->video_rep_index < 0) || (c->videoRepIdx == c->video_rep_index))
+        {
+          ret = av_dynarray_add_nofree(&c->videos, &c->n_videos, rep);
+          c->videoRepIdx++;
+        }
+        else
+        {
+          c->videoRepIdx++;
+          ret = 0;
+          goto free;
+        }
         break;
     case AVMEDIA_TYPE_AUDIO:
-        ret = av_dynarray_add_nofree(&c->audios, &c->n_audios, rep);
+        if((c->audio_rep_index < 0) || (c->audioRepIdx == c->audio_rep_index))
+        {
+          ret = av_dynarray_add_nofree(&c->audios, &c->n_audios, rep);
+          c->audioRepIdx++;
+        }
+        else
+        {
+          c->audioRepIdx++;
+          ret = 0;
+          goto free;
+        }
         break;
     case AVMEDIA_TYPE_SUBTITLE:
+        if((c->video_rep_index >= 0) || (c->audio_rep_index >= 0)) // skeep subtitle
+        {
+          ret = 0;
+          goto free;
+        }
         ret = av_dynarray_add_nofree(&c->subtitles, &c->n_subtitles, rep);
         break;
     }
@@ -1645,6 +1676,8 @@ static int refresh_manifest(AVFormatContext *s)
     c->audios = NULL;
     c->n_subtitles = 0;
     c->subtitles = NULL;
+    c->audioRepIdx = 0;
+    c->videoRepIdx = 0;
     ret = parse_manifest(s, s->url, NULL);
     if (ret)
         goto finish;
@@ -2166,6 +2199,10 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
         av_dict_set(&in_fmt_opts, "decryption_key", pls->cenc_decryption_key, 0);
     else if (c->cenc_decryption_key)
         av_dict_set(&in_fmt_opts, "decryption_key", c->cenc_decryption_key, 0);
+    if (c->cenc_decryption_video_key)
+        av_dict_set(&in_fmt_opts, "decryption_video_key", c->cenc_decryption_video_key, 0);
+    if (c->cenc_decryption_audio_key)
+        av_dict_set(&in_fmt_opts, "decryption_audio_key", c->cenc_decryption_audio_key, 0);
 
     if (pls->cenc_decryption_keys)
         av_dict_set(&in_fmt_opts, "decryption_keys", pls->cenc_decryption_keys, 0);
@@ -2765,6 +2802,10 @@ static const AVOption dash_options[] = {
         OFFSET(allowed_extensions), AV_OPT_TYPE_STRING,
         {.str = "aac,m4a,m4s,m4v,mov,mp4,webm,ts"},
         INT_MIN, INT_MAX, FLAGS},
+    {"audio_rep_index", "audio representation index to be used",
+        OFFSET(audio_rep_index), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, FLAGS},
+    {"video_rep_index", "video representation index to be used",
+        OFFSET(video_rep_index), AV_OPT_TYPE_INT, {.i64 = -1}, INT_MIN, INT_MAX, FLAGS},
     { "cenc_decryption_key", "Media default decryption key (hex)", OFFSET(cenc_decryption_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
