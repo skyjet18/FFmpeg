@@ -754,6 +754,7 @@ TESTPROGS-$(CONFIG_MOV_MUXER)            += movenc
 TESTPROGS-$(CONFIG_MPEGTS_MUXER)         += mpegtsenc
 TESTPROGS-$(CONFIG_HLS_DEMUXER)          += hls_selection
 TESTPROGS-$(CONFIG_DASH_DEMUXER)         += dash_live
+TESTPROGS-$(CONFIG_DASH_DEMUXER)         += dash_http
 TESTPROGS-$(CONFIG_MPEGTS_DEMUXER)       += mpegts_probe
 TESTPROGS-$(CONFIG_NETWORK)              += noproxy
 TESTPROGS-$(CONFIG_SRTP)                 += srtp
