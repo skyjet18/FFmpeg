@@ -1919,6 +1919,25 @@ Disable writing of random access indicator.
 Preserve original timestamps, if value is set to @code{1}. Default value
 is @code{-1}, which results in shifting timestamps so that they start from 0.
 
+@item aac_pts_dejitter @var{integer}
+Set the AAC and AAC-LATM timestamp dejitter threshold in milliseconds.
+Default is @code{60}. Set to @code{0} to disable dejittering.
+
+Generate timestamps from cumulative audio sample counts while the difference
+from the input timestamp is within the threshold. Larger differences and sample
+rate changes start a new sample clock, preserving discontinuities. Packets without
+sufficient timing information retain their timestamps and reset the sample clock.
+PTS and DTS are shifted together; encoded audio data is not changed.
+
+This applies to all MPEG-TS outputs, including stream copy from HLS or DASH.
+Timestamp copying options do not disable dejittering; use
+@code{-aac_pts_dejitter 0} as well when exact timestamp preservation is required.
+For example:
+@example
+ffmpeg -i input.m3u8 -c copy -f mpegts output.ts
+ffmpeg -i input.mpd -c copy -aac_pts_dejitter 0 -f mpegts output.ts
+@end example
+
 @item omit_video_pes_length @var{boolean}
 Omit the PES packet length for video packets. Default is @code{1} (true).
 

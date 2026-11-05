@@ -28,9 +28,12 @@
 #include "libavutil/opt.h"
 
 #include "libavcodec/ac3_parser_internal.h"
+#include "libavcodec/adts_header.h"
+#include "libavcodec/adts_parser.h"
 #include "libavcodec/bytestream.h"
 #include "libavcodec/defs.h"
 #include "libavcodec/h264.h"
+#include "libavcodec/mpeg4audio.h"
 #include "libavcodec/startcode.h"
 
 #include "avformat.h"
@@ -118,6 +121,7 @@ typedef struct MpegTSWrite {
 #define MPEGTS_FLAG_OMIT_RAI        0x40
     int flags;
     int copyts;
+    int aac_pts_dejitter;
     int tables_version;
     int64_t pat_period_us;
     int64_t sdt_period_us;
@@ -262,6 +266,10 @@ typedef struct MpegTSWriteStream {
     /* For Opus */
     int opus_queued_samples;
     int opus_pending_trim_start;
+
+    int64_t aac_anchor_pts;
+    int64_t aac_samples;
+    int aac_sample_rate;
 
     DVBAC3Descriptor *dvb_ac3_desc;
 } MpegTSWriteStream;
@@ -1240,6 +1248,7 @@ static int mpegts_init(AVFormatContext *s)
         }
         ts_st->payload_pts     = AV_NOPTS_VALUE;
         ts_st->payload_dts     = AV_NOPTS_VALUE;
+        ts_st->aac_anchor_pts  = AV_NOPTS_VALUE;
         ts_st->cc              = 15;
         ts_st->discontinuity   = ts->flags & MPEGTS_FLAG_DISCONT;
         if (st->codecpar->codec_id == AV_CODEC_ID_AAC &&
@@ -1850,6 +1859,118 @@ static int opus_get_packet_samples(AVFormatContext *s, AVPacket *pkt)
     return duration;
 }
 
+static int64_t aac_packet_samples(AVFormatContext *s, AVStream *st,
+                                  const AVPacket *pkt, int *sample_rate)
+{
+    const AVCodecParameters *par = st->codecpar;
+    int64_t samples = 0;
+
+    *sample_rate = 0;
+    if (par->codec_id == AV_CODEC_ID_AAC && pkt->size >= 2 &&
+        (AV_RB16(pkt->data) & 0xfff6) == 0xfff0) {
+        const uint8_t *buf = pkt->data;
+        int size = pkt->size;
+
+        while (size > 0) {
+            AACADTSHeaderInfo hdr, *phdr = &hdr;
+
+            if (size < AV_AAC_ADTS_HEADER_SIZE ||
+                avpriv_adts_header_parse(&phdr, buf, size) < 0 ||
+                hdr.frame_length > size ||
+                (*sample_rate && *sample_rate != hdr.sample_rate))
+                return 0;
+            *sample_rate = hdr.sample_rate;
+            samples += hdr.samples;
+            buf  += hdr.frame_length;
+            size -= hdr.frame_length;
+        }
+        return samples;
+    }
+
+    /* ASC describes the core clock, including for HE-AAC with doubled output
+     * sample rate. Do not mix core frame samples with the output sample rate. */
+    if (par->codec_id == AV_CODEC_ID_AAC && par->extradata_size > 0) {
+        MPEG4AudioConfig cfg = { 0 };
+        int bit = avpriv_mpeg4audio_get_config2(&cfg, par->extradata,
+                                               par->extradata_size, 1, s);
+
+        if (bit < 0)
+            return 0;
+        if (cfg.sample_rate > 0 && bit < (int64_t)par->extradata_size * 8 &&
+            (cfg.object_type == AOT_AAC_MAIN || cfg.object_type == AOT_AAC_LC ||
+             cfg.object_type == AOT_AAC_SSR  || cfg.object_type == AOT_AAC_LTP)) {
+            *sample_rate = cfg.sample_rate;
+            return par->extradata[bit / 8] & (0x80 >> (bit % 8)) ? 960 : 1024;
+        }
+    }
+
+    *sample_rate = par->sample_rate;
+    if (*sample_rate <= 0)
+        return 0;
+    if (par->frame_size > 0 && par->codec_id == AV_CODEC_ID_AAC_LATM) {
+        int offset = 0;
+
+        while (pkt->size - offset >= 3 &&
+               (AV_RB16(pkt->data + offset) & 0xffe0) == 0x56e0) {
+            int length = (AV_RB16(pkt->data + offset + 1) & 0x1fff) + 3;
+
+            if (length > pkt->size - offset)
+                return 0;
+            samples += par->frame_size;
+            offset += length;
+        }
+        return offset == pkt->size ? samples : 0;
+    }
+    if (par->frame_size > 0)
+        return par->frame_size;
+    if (pkt->duration > 0)
+        return av_rescale_q(pkt->duration, st->time_base,
+                            (AVRational) { 1, *sample_rate });
+    return 0;
+}
+
+/* Return true when a new sample clock starts, so buffered audio can be
+ * emitted before the discontinuity rather than sharing its PES timestamp. */
+static int aac_dejitter(AVFormatContext *s, AVStream *st, const AVPacket *pkt,
+                        int64_t *pts, int64_t *dts)
+{
+    MpegTSWrite *ts = s->priv_data;
+    MpegTSWriteStream *ts_st = st->priv_data;
+    int sample_rate;
+    int64_t samples, expected, diff;
+    int64_t threshold = (int64_t)ts->aac_pts_dejitter * 90;
+
+    samples = aac_packet_samples(s, st, pkt, &sample_rate);
+    if (*pts == AV_NOPTS_VALUE || samples <= 0) {
+        av_log(s, AV_LOG_DEBUG, "AAC dejitter reset for stream %d: "
+               "missing timestamp or sample count\n", st->index);
+        ts_st->aac_anchor_pts = AV_NOPTS_VALUE;
+        return 0;
+    }
+
+    if (ts_st->aac_anchor_pts != AV_NOPTS_VALUE &&
+        ts_st->aac_sample_rate == sample_rate) {
+        expected = av_sat_add64(ts_st->aac_anchor_pts,
+                               av_rescale(ts_st->aac_samples, 90000, sample_rate));
+        diff = av_sat_sub64(*pts, expected);
+        if (diff >= -threshold && diff <= threshold &&
+            ts_st->aac_samples <= INT64_MAX - samples) {
+            *pts = expected;
+            if (*dts != AV_NOPTS_VALUE)
+                *dts = av_sat_sub64(*dts, diff);
+            ts_st->aac_samples += samples;
+            return 0;
+        }
+        av_log(s, AV_LOG_DEBUG, "AAC dejitter resync for stream %d: "
+               "timestamp error %"PRId64" ticks\n", st->index, diff);
+    }
+
+    ts_st->aac_anchor_pts = *pts;
+    ts_st->aac_samples = samples;
+    ts_st->aac_sample_rate = sample_rate;
+    return 1;
+}
+
 static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
 {
     AVStream *st = s->streams[pkt->stream_index];
@@ -1871,6 +1992,16 @@ static int mpegts_write_packet_internal(AVFormatContext *s, AVPacket *pkt)
                                         &side_data_size);
     if (side_data)
         stream_id = side_data[0];
+
+    if (ts->aac_pts_dejitter &&
+        (st->codecpar->codec_id == AV_CODEC_ID_AAC ||
+         st->codecpar->codec_id == AV_CODEC_ID_AAC_LATM) &&
+        aac_dejitter(s, st, pkt, &pts, &dts) && ts_st->payload_size) {
+        mpegts_write_pes(s, st, ts_st->payload, ts_st->payload_size,
+                         ts_st->payload_pts, ts_st->payload_dts,
+                         ts_st->payload_flags & AV_PKT_FLAG_KEY, stream_id);
+        ts_st->payload_size = 0;
+    }
 
     if (!ts->first_dts_checked && dts != AV_NOPTS_VALUE) {
         ts->first_pcr += dts * 300;
@@ -2334,6 +2465,8 @@ static const AVOption options[] = {
     { "omit_rai", "Disable writing of random access indicator",
       0, AV_OPT_TYPE_CONST, { .i64 = MPEGTS_FLAG_OMIT_RAI }, 0, INT_MAX, ENC, "mpegts_flags" },
     { "mpegts_copyts", "don't offset dts/pts", OFFSET(copyts), AV_OPT_TYPE_BOOL, { .i64 = -1 }, -1, 1, ENC },
+    { "aac_pts_dejitter", "AAC timestamp dejitter threshold in milliseconds (0 disables)",
+      OFFSET(aac_pts_dejitter), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, ENC },
     { "tables_version", "set PAT, PMT, SDT and NIT version", OFFSET(tables_version), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 31, ENC },
     { "omit_video_pes_length", "Omit the PES packet length for video packets",
       OFFSET(omit_video_pes_length), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, ENC },
