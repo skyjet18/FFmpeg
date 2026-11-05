@@ -37,6 +37,11 @@ fate-hls-selection: libavformat/tests/hls_selection$(EXESUF)
 fate-hls-selection: CMD = run libavformat/tests/hls_selection$(EXESUF)
 fate-hls-selection: CMP = null
 
+FATE_LIBAVFORMAT-$(CONFIG_DASH_DEMUXER) += fate-dash-live
+fate-dash-live: libavformat/tests/dash_live$(EXESUF)
+fate-dash-live: CMD = run libavformat/tests/dash_live$(EXESUF)
+fate-dash-live: CMP = null
+
 FATE_LIBAVFORMAT-$(CONFIG_IMF_DEMUXER) += fate-imf
 fate-imf: libavformat/tests/imf$(EXESUF)
 fate-imf: CMD = run libavformat/tests/imf$(EXESUF)
