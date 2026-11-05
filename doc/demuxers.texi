@@ -400,6 +400,16 @@ available in a metadata key named "variant_bitrate".
 It accepts the following options:
 
 @table @option
+@item hls_quality_mode
+Preselect a variant before opening media playlists: 0 opens all variants
+(default), 1 selects the lowest advertised bandwidth, and 2 selects the highest.
+This limits the representations available until the input is reopened. Shared
+audio and subtitle renditions belonging to the selected variant remain available.
+
+@item hls_audio_default_only
+Open only default audio renditions in groups declaring a default. Groups without
+a default retain all renditions. Disabled by default.
+
 @item live_start_index
 segment index to start live streams at (negative values are from the end).
 

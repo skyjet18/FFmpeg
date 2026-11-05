@@ -23,6 +23,10 @@ fate-movenc: libavformat/tests/movenc$(EXESUF)
 fate-movenc: CMD = run libavformat/tests/movenc$(EXESUF)
 
 FATE_LIBAVFORMAT-$(CONFIG_MPEGTS_MUXER) += fate-mpegtsenc
+FATE_LIBAVFORMAT-$(CONFIG_HLS_DEMUXER) += fate-hls-selection
+fate-hls-selection: libavformat/tests/hls_selection$(EXESUF)
+fate-hls-selection: CMD = run libavformat/tests/hls_selection
+fate-hls-selection: CMP = null
 fate-mpegtsenc: libavformat/tests/mpegtsenc$(EXESUF)
 fate-mpegtsenc: CMD = run libavformat/tests/mpegtsenc$(EXESUF)
 fate-mpegtsenc: CMP = null

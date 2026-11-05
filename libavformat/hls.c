@@ -130,6 +130,7 @@ struct playlist {
     struct segment **segments;
     int needed;
     int broken;
+    int excluded;
     int64_t cur_seq_no;
     int64_t last_seq_no;
     int64_t active_discontinuity_sequence;
@@ -242,6 +243,9 @@ typedef struct HLSContext {
     int seg_max_retry;
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
+    int hls_quality_mode;
+    int hls_audio_default_only;
+    int selected_variant;
 } HLSContext;
 
 static void free_segment_dynarray(struct segment **segments, int n_segments)
@@ -329,10 +333,10 @@ static void update_duration(AVFormatContext *s)
     int i;
 
      /* If this isn't a live stream, calculate the total duration of the stream. */
-    if (c->n_variants > 0 && (c->variants[0]->playlists[0]->finished || c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT)) {
+    if (c->n_variants > 0 && (c->variants[c->selected_variant]->playlists[0]->finished || c->variants[c->selected_variant]->playlists[0]->type == PLS_TYPE_EVENT)) {
         int64_t duration = 0;
-        for (i = 0; i < c->variants[0]->playlists[0]->n_segments; i++)
-            duration += c->variants[0]->playlists[0]->segments[i]->duration;
+        for (i = 0; i < c->variants[c->selected_variant]->playlists[0]->n_segments; i++)
+            duration += c->variants[c->selected_variant]->playlists[0]->segments[i]->duration;
         s->duration = duration;
     }
 }
@@ -1172,9 +1176,9 @@ fail:
     if (close_in)
         ff_format_io_close(c->ctx, &in);
     c->ctx->ctx_flags = c->ctx->ctx_flags & ~(unsigned)AVFMTCTX_UNSEEKABLE;
-    if (!c->n_variants || !c->variants[0]->n_playlists ||
-        !(c->variants[0]->playlists[0]->finished ||
-          c->variants[0]->playlists[0]->type == PLS_TYPE_EVENT))
+    if (!c->n_variants || !c->variants[c->selected_variant]->n_playlists ||
+        !(c->variants[c->selected_variant]->playlists[0]->finished ||
+          c->variants[c->selected_variant]->playlists[0]->type == PLS_TYPE_EVENT))
         c->ctx->ctx_flags |= AVFMTCTX_UNSEEKABLE;
 
     update_duration(c->ctx);
@@ -1641,6 +1645,19 @@ static int playlist_needed(struct playlist *pls)
     return 0;
 }
 
+static int resync_sequence(struct playlist *v)
+{
+    if (!v->finished && v->n_segments > 0 &&
+        v->cur_seq_no > v->start_seq_no &&
+        v->cur_seq_no - v->start_seq_no > (int64_t)v->n_segments + 6) {
+        v->cur_seq_no = v->start_seq_no + FFMAX(v->n_segments - 2, 0);
+        v->last_seq_no = v->cur_seq_no;
+        v->m3u8_hold_counters = 0;
+        return 1;
+    }
+    return 0;
+}
+
 static int reload_playlist(struct playlist *v, HLSContext *c)
 {
     int ret = 0;
@@ -1689,6 +1706,10 @@ reload:
                    v->start_seq_no - v->cur_seq_no);
             v->cur_seq_no = v->start_seq_no;
         }
+        if (resync_sequence(v))
+            av_log(v->parent, AV_LOG_WARNING,
+                   "Media sequence reset, resuming at segment %"PRId64"\n",
+                   v->cur_seq_no);
         if (v->cur_seq_no > v->last_seq_no) {
             v->last_seq_no = v->cur_seq_no;
             v->m3u8_hold_counters = 0;
@@ -2050,12 +2071,12 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
     /* If playback is already in progress (we are just selecting a new
      * playlist) and this is a complete file, find the matching segment
      * by counting durations. */
-    if ((pls->finished || pls->type == PLS_TYPE_EVENT) && c->cur_timestamp != AV_NOPTS_VALUE) {
+    if (pls->finished && c->cur_timestamp != AV_NOPTS_VALUE) {
         find_timestamp_in_playlist(c, pls, c->cur_timestamp, &seq_no, NULL);
         return seq_no;
     }
 
-    if (!pls->finished && pls->type != PLS_TYPE_EVENT) {
+    if (!pls->finished) {
         if (!c->first_packet && c->cur_timestamp != AV_NOPTS_VALUE) {
             find_timestamp_in_playlist(c, pls, c->cur_timestamp, &seq_no, NULL);
             return seq_no;
@@ -2223,6 +2244,59 @@ static int hls_close(AVFormatContext *s)
     return 0;
 }
 
+static int rendition_selected(HLSContext *c, struct rendition *rend)
+{
+    struct variant *v = c->variants[c->selected_variant];
+    const char *group = rend->type == AVMEDIA_TYPE_AUDIO ? v->audio_group :
+                        rend->type == AVMEDIA_TYPE_VIDEO ? v->video_group :
+                        v->subtitles_group;
+    int i;
+
+    if (c->hls_quality_mode && strcmp(group, rend->group_id))
+        return 0;
+    if (c->hls_audio_default_only && rend->type == AVMEDIA_TYPE_AUDIO &&
+        !(rend->disposition & AV_DISPOSITION_DEFAULT)) {
+        for (i = 0; i < c->n_renditions; i++) {
+            struct rendition *other = c->renditions[i];
+            if (other->type == AVMEDIA_TYPE_AUDIO &&
+                !strcmp(other->group_id, rend->group_id) &&
+                (other->disposition & AV_DISPOSITION_DEFAULT))
+                return 0;
+        }
+    }
+    return 1;
+}
+
+static void preselect_playlists(HLSContext *c)
+{
+    int i, j;
+    c->selected_variant = 0;
+    if (c->hls_quality_mode) {
+        for (i = 1; i < c->n_variants; i++) {
+            int bandwidth = c->variants[i]->bandwidth;
+            int best = c->variants[c->selected_variant]->bandwidth;
+            if ((c->hls_quality_mode == 1 && bandwidth < best) ||
+                (c->hls_quality_mode == 2 && bandwidth > best))
+                c->selected_variant = i;
+        }
+    }
+    for (i = 0; i < c->n_playlists; i++) {
+        struct playlist *pls = c->playlists[i];
+        int keep = 0;
+        for (j = 0; j < c->n_variants; j++) {
+            if ((!c->hls_quality_mode || j == c->selected_variant) &&
+                c->variants[j]->playlists[0] == pls)
+                keep = 1;
+        }
+        for (j = 0; j < c->n_renditions; j++) {
+            struct rendition *rend = c->renditions[j];
+            if (rend->playlist == pls && rendition_selected(c, rend))
+                keep = 1;
+        }
+        pls->excluded = !keep;
+    }
+}
+
 static int hls_read_header(AVFormatContext *s)
 {
     HLSContext *c = s->priv_data;
@@ -2232,6 +2306,7 @@ static int hls_read_header(AVFormatContext *s)
     c->interrupt_callback = &s->interrupt_callback;
 
     c->first_packet = 1;
+    c->selected_variant = 0;
     c->first_timestamp = AV_NOPTS_VALUE;
     c->cur_timestamp = AV_NOPTS_VALUE;
 
@@ -2250,11 +2325,14 @@ static int hls_read_header(AVFormatContext *s)
         av_log(s, AV_LOG_WARNING, "Empty playlist\n");
         return AVERROR_EOF;
     }
+    preselect_playlists(c);
     /* If the playlist only contained playlists (Master Playlist),
      * parse each individual playlist. */
     if (c->n_playlists > 1 || c->playlists[0]->n_segments == 0) {
         for (i = 0; i < c->n_playlists; i++) {
             struct playlist *pls = c->playlists[i];
+            if (pls->excluded)
+                continue;
             pls->m3u8_hold_counters = 0;
             if ((ret = parse_playlist(c, pls->url, pls, NULL)) < 0) {
                 av_log(s, AV_LOG_WARNING, "parse_playlist error %s [%s]\n", av_err2str(ret), pls->url);
@@ -2267,6 +2345,8 @@ static int hls_read_header(AVFormatContext *s)
     }
 
     for (i = 0; i < c->n_variants; i++) {
+        if (c->variants[i]->playlists[0]->excluded)
+            continue;
         if (c->variants[i]->playlists[0]->n_segments == 0) {
             av_log(s, AV_LOG_WARNING, "Empty segment [%s]\n", c->variants[i]->playlists[0]->url);
             c->variants[i]->playlists[0]->broken = 1;
@@ -2300,7 +2380,7 @@ static int hls_read_header(AVFormatContext *s)
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
 
-        if (pls->n_segments == 0)
+        if (pls->excluded || pls->n_segments == 0)
             continue;
 
         pls->cur_seq_no = select_cur_seq_no(c, pls);
@@ -2317,6 +2397,8 @@ static int hls_read_header(AVFormatContext *s)
         AVDictionary *options = NULL;
         struct segment *seg = NULL;
 
+        if (pls->excluded)
+            continue;
         if (!(pls->ctx = avformat_alloc_context()))
             return AVERROR(ENOMEM);
 
@@ -2514,7 +2596,7 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
 
         cur_needed = playlist_needed(c->playlists[i]);
 
-        if (pls->broken) {
+        if (pls->broken || pls->excluded) {
             continue;
         }
         if (cur_needed && !pls->needed) {
@@ -2916,6 +2998,10 @@ static int hls_probe(const AVProbeData *p)
 #define OFFSET(x) offsetof(HLSContext, x)
 #define FLAGS AV_OPT_FLAG_DECODING_PARAM
 static const AVOption hls_options[] = {
+    {"hls_quality_mode", "Preselect one variant: 0=all, 1=lowest bandwidth, 2=highest bandwidth",
+        OFFSET(hls_quality_mode), AV_OPT_TYPE_INT, {.i64 = 0}, 0, 2, FLAGS},
+    {"hls_audio_default_only", "Only open default audio renditions when a group has a default",
+        OFFSET(hls_audio_default_only), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
     {"live_start_index", "segment index to start live streams at (negative values are from the end)",
         OFFSET(live_start_index), AV_OPT_TYPE_INT, {.i64 = -3}, INT_MIN, INT_MAX, FLAGS},
     {"prefer_x_start", "prefer to use #EXT-X-START if it's in playlist instead of live_start_index",
