@@ -274,6 +274,11 @@ which streams to actually receive.
 Each stream mirrors the @code{id} and @code{bandwidth} properties from the
 @code{<Representation>} as metadata keys named "id" and "variant_bitrate" respectively.
 
+For single-file VOD representations, seeks also retain the target for discarded
+streams. When reselected, a representation is reopened at the saved seek target
+or the current audio/video demux position if playback has advanced, rather than
+at the beginning of its file. Reopen and seek failures are returned to the caller.
+
 For live media fragments, transient open failures (including HTTP 404 and 5xx)
 are retried at most twice, with interruptible 400 millisecond waits. VOD,
 initialization sections, and permanent errors such as HTTP 401/403 are not

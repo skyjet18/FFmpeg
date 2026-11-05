@@ -116,6 +116,17 @@ static void test_seek(void)
                rep.cur_seq_no == 101);
     seek_context->priv_data = NULL;
     avformat_free_context(seek_context);
+    rep.n_fragments = 1;
+    av_assert0(!dash_seek(&s, &rep, 12375, AVSEEK_FLAG_BACKWARD, 1));
+    av_assert0(rep.seek_pending && rep.seek_pos_msec == 12375 &&
+               rep.seek_flags == AVSEEK_FLAG_BACKWARD && rep.cur_timestamp == 1113750);
+    av_assert0(dash_seek(&s, &rep, INT64_MAX, 0, 1) == AVERROR(EINVAL));
+    av_assert0(rep.seek_pending && rep.seek_pos_msec == 12375);
+    s.interrupt_callback.callback = test_interrupt;
+    cancel_at = 1;
+    av_assert0(recheck_discard_flags(&s, videos, 1) == AVERROR_EXIT);
+    av_assert0(!rep.ctx && rep.seek_pending);
+    cancel_at = 0;
 }
 
 int main(void)

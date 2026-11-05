@@ -120,6 +120,9 @@ struct representation {
     uint32_t init_sec_buf_read_offset;
     int64_t cur_timestamp;
     int64_t first_pts;
+    int64_t seek_pos_msec;
+    int seek_flags;
+    int seek_pending;
     int is_restart_needed;
     int input_read_done; /* segment read to its end, connection still usable */
     int input_reuse;     /* demuxer restarted: send the next request on that connection */
@@ -131,6 +134,7 @@ struct representation {
 
 typedef struct DASHContext {
     const AVClass *class;
+    int64_t cur_timestamp; /* Last returned A/V packet or seek target, in 90-kHz ticks. */
     char *base_url;
 
     int n_videos;
@@ -2309,6 +2313,26 @@ static void close_demux_for_component(struct representation *pls)
     avformat_close_input(&pls->ctx);
 }
 
+static int seek_single_fragment(struct representation *pls)
+{
+    int ret;
+
+    if (pls->seek_pos_msec > INT64_MAX / 1000 || pls->seek_pos_msec < INT64_MIN / 1000) {
+        av_log(pls->parent, AV_LOG_ERROR, "Single-file DASH seek target is out of range\n");
+        return AVERROR(EINVAL);
+    }
+    ff_read_frame_flush(pls->ctx);
+    ret = av_seek_frame(pls->ctx, -1, pls->seek_pos_msec * 1000, pls->seek_flags);
+    if (ret < 0) {
+        av_log(pls->parent, AV_LOG_ERROR, "Failed to seek single-file DASH component: %s\n",
+               av_err2str(ret));
+        return ret;
+    }
+    pls->cur_timestamp = av_rescale(pls->seek_pos_msec, 90, 1);
+    pls->seek_pending = 0;
+    return 0;
+}
+
 static int reopen_demux_for_component(AVFormatContext *s, struct representation *pls)
 {
     DASHContext *c = s->priv_data;
@@ -2399,8 +2423,17 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
         if (ret < 0)
             goto fail;
     }
+    if (pls->seek_pending)
+        ret = seek_single_fragment(pls);
 
 fail:
+    if (ret < 0) {
+        if (pls->ctx)
+            close_demux_for_component(pls);
+        else
+            av_freep(&pls->pb.pub.buffer);
+        ff_format_io_close(pls->parent, &pls->input);
+    }
     return ret;
 }
 
@@ -2621,9 +2654,10 @@ static int dash_read_header(AVFormatContext *s)
     return 0;
 }
 
-static void recheck_discard_flags(AVFormatContext *s, struct representation **p, int n)
+static int recheck_discard_flags(AVFormatContext *s, struct representation **p, int n)
 {
-    int i, j;
+    DASHContext *c = s->priv_data;
+    int i, j, ret;
 
     for (i = 0; i < n; i++) {
         struct representation *pls = p[i];
@@ -2636,7 +2670,18 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
             for (j = 0; j < n; j++) {
                 pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
             }
-            reopen_demux_for_component(s, pls);
+            if (!c->is_live && pls->n_fragments == 1) {
+                int64_t position = av_rescale(c->cur_timestamp, 1000, 90000);
+                if (!pls->seek_pending || pls->seek_pos_msec < position) {
+                    pls->seek_pos_msec = position;
+                    if (!pls->seek_pending)
+                        pls->seek_flags = 0;
+                    pls->seek_pending = 1;
+                }
+            }
+            ret = reopen_demux_for_component(s, pls);
+            if (ret < 0)
+                return ret;
             av_log(s, AV_LOG_INFO, "Now receiving stream_index %d\n", pls->stream_index);
         } else if (!needed && pls->ctx) {
             close_demux_for_component(pls);
@@ -2644,6 +2689,7 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
             av_log(s, AV_LOG_INFO, "No longer receiving stream_index %d\n", pls->stream_index);
         }
     }
+    return 0;
 }
 
 static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -2654,9 +2700,10 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
     struct representation *cur = NULL;
     struct representation *rep = NULL;
 
-    recheck_discard_flags(s, c->videos, c->n_videos);
-    recheck_discard_flags(s, c->audios, c->n_audios);
-    recheck_discard_flags(s, c->subtitles, c->n_subtitles);
+    if ((ret = recheck_discard_flags(s, c->videos, c->n_videos)) < 0 ||
+        (ret = recheck_discard_flags(s, c->audios, c->n_audios)) < 0 ||
+        (ret = recheck_discard_flags(s, c->subtitles, c->n_subtitles)) < 0)
+        return ret;
 
     for (i = 0; i < c->n_videos; i++) {
         rep = c->videos[i];
@@ -2719,6 +2766,8 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
 
             /* If we got a packet, return it */
             cur->cur_timestamp = av_rescale(pkt->pts, (int64_t)cur->ctx->streams[0]->time_base.num * 90000, cur->ctx->streams[0]->time_base.den);
+            if (pkt->pts != AV_NOPTS_VALUE && cur->type != AVMEDIA_TYPE_SUBTITLE)
+                c->cur_timestamp = cur->cur_timestamp;
             pkt->stream_index = cur->stream_index;
             return 0;
         }
@@ -2762,14 +2811,14 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
 
     // single fragment mode
     if (pls->n_fragments == 1) {
-        pls->cur_timestamp = 0;
-        pls->cur_seg_offset = 0;
-        if (dry_run)
-            return 0;
-        ff_read_frame_flush(pls->ctx);
         if (seek_pos_msec > INT64_MAX / 1000 || seek_pos_msec < INT64_MIN / 1000)
             return AVERROR(EINVAL);
-        return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
+        pls->seek_pos_msec = seek_pos_msec;
+        pls->seek_flags = flags;
+        pls->seek_pending = 1;
+        pls->cur_timestamp = av_rescale(seek_pos_msec, 90, 1);
+        pls->cur_seg_offset = 0;
+        return dry_run ? 0 : seek_single_fragment(pls);
     }
 
     ff_format_io_close(pls->parent, &pls->input);
@@ -2867,6 +2916,8 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
         if (!ret)
             ret = dash_seek(s, c->subtitles[i], seek_pos_msec, flags, !c->subtitles[i]->ctx);
     }
+    if (!ret)
+        c->cur_timestamp = av_rescale(seek_pos_msec, 90, 1);
 
     return ret;
 }

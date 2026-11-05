@@ -41,6 +41,13 @@ def main():
         video.write_bytes(bytes([96]) * (16 * 16 * 3 // 2 * 25))
         raw_video = ("-f", "rawvideo", "-pixel_format", "yuv420p",
                      "-video_size", "16x16", "-i", str(video))
+        run(args.ffmpeg, "-y", "-stream_loop", "-1", "-f", "s16le",
+            "-ar", "48000", "-ac", "2", "-i", str(audio),
+            "-stream_loop", "-1", *raw_video, "-map", "1:v",
+            "-map", "0:a", "-map", "0:a", "-t", "40", "-c:a", "aac",
+            "-c:v", "mpeg2video", "-g", "12", "-bf", "2",
+            "-seg_duration", "1", "-single_file", "1", "-f", "dash",
+            str(root / "single.mpd"))
         run(args.ffmpeg, "-y", "-f", "s16le", "-ar", "48000", "-ac", "2",
             "-i", str(audio), *raw_video, "-map", "0:a", "-map", "1:v",
             "-t", "1", "-c:a", "aac", "-c:v", "mpeg2video",
@@ -54,6 +61,15 @@ def main():
             encoding="ascii")
         ns = {"d": "urn:mpeg:dash:schema:mpd:2011"}
         ET.register_namespace("", ns["d"])
+        single = ET.parse(root / "single.mpd").getroot()
+        for representation in single.findall(".//d:Representation", ns):
+            segments = representation.find("d:SegmentList", ns)
+            initialization = segments.find("d:Initialization", ns)
+            segment_base = ET.Element(f"{{{ns['d']}}}SegmentBase")
+            segment_base.append(initialization)
+            representation.remove(segments)
+            representation.append(segment_base)
+        (root / "single.mpd").write_bytes(ET.tostring(single))
         mpd = ET.parse(root / "static.mpd").getroot()
         mpd.set("type", "dynamic")
         mpd.set("minimumUpdatePeriod", "PT0S")
@@ -145,6 +161,16 @@ def main():
         thread.start()
         base = f"http://127.0.0.1:{server.server_port}"
         try:
+            output = run(args.driver, "switch", base + "/single.mpd")
+            starts = re.findall(r"stage=(\d+) type=(\d+) first_us=(-?\d+)", output)
+            assert len(starts) == 10, output
+            targets = (0, 12375000, 4375000, 30375000, 32375000)
+            for stage, kind, pts in starts:
+                # MPEG-2 GOP is 12 frames at 25 fps; AAC may need one
+                # preroll frame before the frame containing the seek point.
+                tolerance = 480000 if int(kind) == 0 else 43000
+                assert abs(int(pts) - targets[int(stage)]) <= tolerance, output
+            print("PASS single-file DASH: startup, fractional closed-track seeks and direct reactivation")
             for path, live, cancel, expected, success in (
                 ("/late.m4s", 1, 0, 3, True),
                 ("/missing.m4s", 1, 0, 3, False),
