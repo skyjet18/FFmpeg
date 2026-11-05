@@ -100,6 +100,13 @@ static int append_packet_chunked(AVIOContext *s, AVPacket *pkt, int size)
     return pkt->size > orig_size ? pkt->size - orig_size : ret;
 }
 
+// Chromium: We use the internal field first_dts vvv
+int64_t av_stream_get_first_dts(const AVStream *st)
+{
+  return cffstream(st)->first_dts;
+}
+// Chromium: We use the internal field first_dts ^^^
+
 int av_get_packet(AVIOContext *s, AVPacket *pkt, int size)
 {
 #if FF_API_INIT_PACKET
