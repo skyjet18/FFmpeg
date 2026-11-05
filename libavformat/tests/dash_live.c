@@ -45,6 +45,31 @@ static void test_live_start(void)
     av_assert0(calc_common_live_start(&c) == -1000);
 }
 
+/* Segments of a fixed duration counted from availabilityStartTime. */
+static void test_duration_live_start(void)
+{
+    struct representation fixed = {.fragment_duration = 3840, .fragment_timescale = 1000,
+                                   .first_seq_no = 100};
+    DASHContext c = {.min_buffer_time = 2, .is_live = 1,
+                     .live_start_time = AV_NOPTS_VALUE};
+    AVFormatContext s = {.priv_data = &c};
+
+    av_assert0(duration_live_delay(&c, &fixed) == 16);
+    c.suggested_presentation_delay = 24;
+    av_assert0(duration_live_delay(&c, &fixed) == 24);
+    c.live_delay = 5;
+    av_assert0(duration_live_delay(&c, &fixed) == 5);
+    c.live_delay = c.suggested_presentation_delay = 0;
+    c.availability_start_time = get_current_time_in_sec() - 120;
+    av_assert0(calc_cur_seg_no(&s, &fixed) == 127);
+    /* suggestedPresentationDelay gives the segment it gave before */
+    c.suggested_presentation_delay = 24;
+    av_assert0(calc_cur_seg_no(&s, &fixed) == 125);
+    c.suggested_presentation_delay = 0;
+    c.availability_start_time = get_current_time_in_sec() + 5;
+    av_assert0(calc_cur_seg_no(&s, &fixed) == 100);
+}
+
 static void test_subtitle_discard(void)
 {
     AVStream subtitle = {0};
@@ -74,6 +99,7 @@ static void test_subtitle_discard(void)
 int main(void)
 {
     test_live_start();
+    test_duration_live_start();
     test_subtitle_discard();
     return 0;
 }
