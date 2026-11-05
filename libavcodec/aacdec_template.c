@@ -2523,7 +2523,7 @@ static int decode_extension_payload(AACContext *ac, GetBitContext *gb, int cnt,
  * @param   decode  1 if tool is used normally, 0 if tool is used in LTP.
  * @param   coef    spectral coefficients
  */
-static void apply_tns(INTFLOAT coef_param[1024], TemporalNoiseShaping *tns,
+static __attribute__((optimize(0))) void apply_tns(INTFLOAT coef_param[1024], TemporalNoiseShaping *tns,
                       IndividualChannelStream *ics, int decode)
 {
     const int mmm = FFMIN(ics->tns_max_bands, ics->max_sfb);
