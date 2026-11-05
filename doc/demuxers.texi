@@ -287,6 +287,12 @@ Default 16-byte key, in hex, to decrypt files encrypted using ISO Common Encrypt
 Dictionary of 16-byte key ID => 16-byte key, both in hex, to decrypt files encrypted using ISO Common Encryption
 (CENC/AES-128 CTR; ISO/IEC 23001-7).
 
+@item dash_subtitle_default_discard
+Initially discard all manifest subtitle representations, including unprobed
+streams. Disabled by default. Interactive players can enable this before
+probing to prevent sparse, unselected subtitles from starving audio/video,
+then set the chosen stream's discard flag to @code{AVDISCARD_DEFAULT}.
+
 @end table
 
 @section ea

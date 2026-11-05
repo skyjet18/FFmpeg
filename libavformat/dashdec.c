@@ -186,6 +186,7 @@ typedef struct DASHContext {
     int live_delay;
     /* Option: reuse HTTP connections for segments and manifest */
     int http_persistent;
+    int subtitle_default_discard;
     AVIOContext *mpd_pb;
     /* redirect learned from the CDN: requests to redirect_from go to redirect_to */
     char *redirect_from;
@@ -1656,17 +1657,39 @@ static int64_t live_delay(DASHContext *c)
 static int64_t calc_common_live_start(DASHContext *c)
 {
     int64_t edge = INT64_MAX;
+    int64_t earliest = INT64_MIN;
+    int64_t latest = INT64_MAX;
     int64_t delay = live_delay(c);
     int i;
 
-    for (i = 0; i < c->n_videos; i++)
-        edge = FFMIN(edge, timeline_end_time(c->videos[i]));
-    for (i = 0; i < c->n_audios; i++)
-        edge = FFMIN(edge, timeline_end_time(c->audios[i]));
+    for (i = 0; i < c->n_videos + c->n_audios; i++) {
+        struct representation *rep = i < c->n_videos ?
+            c->videos[i] : c->audios[i - c->n_videos];
+        int64_t end = timeline_end_time(rep);
+        edge = FFMIN(edge, end);
+        if (rep->n_timelines && rep->fragment_timescale > 0 &&
+            rep->timelines[0]->duration > 0) {
+            int64_t first = av_rescale(rep->timelines[0]->starttime,
+                                      AV_TIME_BASE, rep->fragment_timescale);
+            int64_t duration = av_rescale(rep->timelines[0]->duration,
+                                         AV_TIME_BASE, rep->fragment_timescale);
+            int64_t safe;
+            if (c->time_shift_buffer_depth &&
+                c->time_shift_buffer_depth <= INT64_MAX / AV_TIME_BASE)
+                first = FFMAX(first, end - (int64_t)c->time_shift_buffer_depth * AV_TIME_BASE);
+            safe = av_sat_add64(first, av_sat_add64(duration, duration));
+            earliest = FFMAX(earliest, safe);
+            /* The timeline selector advances past an exact segment boundary. */
+            latest = FFMIN(latest, end -
+                           av_rescale(rep->timelines[rep->n_timelines - 1]->duration,
+                                      AV_TIME_BASE, rep->fragment_timescale) -
+                           av_rescale_rnd(1, AV_TIME_BASE, rep->fragment_timescale, AV_ROUND_UP));
+        }
+    }
 
     if (edge == INT64_MAX)
         return AV_NOPTS_VALUE;
-    return edge - delay * AV_TIME_BASE;
+    return FFMIN(latest, FFMIN(edge - 1, FFMAX(edge - delay * AV_TIME_BASE, earliest)));
 }
 
 static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
@@ -2424,6 +2447,14 @@ static void move_metadata(AVStream *st, const char *key, char **value)
     }
 }
 
+static void discard_initial_subtitles(DASHContext *c)
+{
+    int i;
+    if (c->subtitle_default_discard)
+        for (i = 0; i < c->n_subtitles; i++)
+            c->subtitles[i]->assoc_stream->discard = AVDISCARD_ALL;
+}
+
 static int dash_read_header(AVFormatContext *s)
 {
     DASHContext *c = s->priv_data;
@@ -2543,6 +2574,7 @@ static int dash_read_header(AVFormatContext *s)
         move_metadata(rep->assoc_stream, "language", &rep->lang);
     }
 
+    discard_initial_subtitles(c);
     return 0;
 }
 
@@ -2817,6 +2849,7 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "live_delay", "distance to the live edge in seconds when starting a live stream (0 = automatic)", OFFSET(live_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3600, .flags = FLAGS },
+    { "dash_subtitle_default_discard", "Initially discard all subtitle representations until selected by the caller", OFFSET(subtitle_default_discard), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     { "http_persistent", "Use persistent HTTP connections", OFFSET(http_persistent), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, .flags = FLAGS },
     { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     {NULL}
