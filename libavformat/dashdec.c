@@ -2349,6 +2349,38 @@ static int update_init_section(struct representation *pls)
     return 0;
 }
 
+static int retryable_fragment_error(int error)
+{
+    return error == AVERROR_HTTP_NOT_FOUND || error == AVERROR_HTTP_SERVER_ERROR ||
+           error == AVERROR(ETIMEDOUT) || error == AVERROR(ECONNRESET) ||
+           error == AVERROR(ECONNREFUSED) || error == AVERROR(EPIPE) ||
+           error == AVERROR(EIO) || error == AVERROR(EAGAIN);
+}
+
+/* Open the current media fragment. A live fragment that cannot be opened
+ * for a reason that may pass (not published yet, a server or connection
+ * error) is tried twice more, 400 ms apart, before the caller gives it up. */
+static int open_media_fragment(DASHContext *c, struct representation *v)
+{
+    int ret, attempt;
+    for (attempt = 0; ; attempt++) {
+        if (ff_check_interrupt(c->interrupt_callback))
+            return AVERROR_EXIT;
+        ret = open_input(c, v, v->cur_seg);
+        if (ret >= 0 || !c->is_live || attempt == 2 || !retryable_fragment_error(ret))
+            return ret;
+        av_log(v->parent, AV_LOG_WARNING,
+               "Live fragment open failed (%s), retrying (%d/2)\n",
+               av_err2str(ret), attempt + 1);
+        /* Also works for DASH builds without network protocol support. */
+        for (int waited = 0; waited < 400000; waited += 10000) {
+            if (ff_check_interrupt(c->interrupt_callback))
+                return AVERROR_EXIT;
+            av_usleep(10000);
+        }
+    }
+}
+
 static int64_t seek_data(void *opaque, int64_t offset, int whence)
 {
     struct representation *v = opaque;
@@ -2381,7 +2413,7 @@ restart:
         if (ret)
             goto end;
 
-        ret = open_input(c, v, v->cur_seg);
+        ret = open_media_fragment(c, v);
         if (ret < 0) {
             if (ff_check_interrupt(c->interrupt_callback)) {
                 ret = AVERROR_EXIT;
@@ -3146,6 +3178,8 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
         if (dry_run)
             return 0;
         ff_read_frame_flush(pls->ctx);
+        if (seek_pos_msec > INT64_MAX / 1000 || seek_pos_msec < INT64_MIN / 1000)
+            return AVERROR(EINVAL);
         return av_seek_frame(pls->ctx, -1, seek_pos_msec * 1000, flags);
     }
 
@@ -3156,13 +3190,17 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
         int64_t num = pls->first_seq_no;
         /* the packets of all representations were shifted by first_pts_time (AV_TIME_BASE) */
         if (c->first_pts_time != AV_NOPTS_VALUE)
-            seek_pos_msec += c->first_pts_time / 1000;
+            seek_pos_msec = av_sat_add64(seek_pos_msec,
+                av_rescale_q(c->first_pts_time, AV_TIME_BASE_Q, (AVRational){1, 1000}));
 
         if(c->is_live)
         {
             /* don't allow to jump after last available segment */
-            int64_t seek_limit = av_rescale(get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF), 1000, pls->fragment_timescale)
-                                 - 2 * c->min_buffer_time * 1000;
+            int64_t seek_limit = av_sat_sub64(
+                av_rescale(get_segment_start_time_based_on_timeline(pls, 0xFFFFFFFF),
+                           1000, pls->fragment_timescale),
+                c->min_buffer_time > INT64_MAX / 2000 ? INT64_MAX :
+                (int64_t)c->min_buffer_time * 2000);
 
             if( seek_limit < seek_pos_msec )
             {
@@ -3178,13 +3216,15 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
                 duration = pls->timelines[i]->starttime;
             }
             duration += pls->timelines[i]->duration;
-            if (seek_pos_msec < av_rescale(duration, 1000, pls->fragment_timescale)) {
+            /* the end of a segment rounded up: rounded down, a position in
+             * its last millisecond would be taken for the next segment */
+            if (seek_pos_msec < av_rescale_rnd(duration, 1000, pls->fragment_timescale, AV_ROUND_UP)) {
                 goto set_seq_num;
             }
             for (j = 0; j < pls->timelines[i]->repeat; j++) {
                 duration += pls->timelines[i]->duration;
                 num++;
-                if (seek_pos_msec < av_rescale(duration, 1000, pls->fragment_timescale)) {
+                if (seek_pos_msec < av_rescale_rnd(duration, 1000, pls->fragment_timescale, AV_ROUND_UP)) {
                     goto set_seq_num;
                 }
             }
@@ -3196,7 +3236,9 @@ set_seq_num:
         av_log(pls->parent, AV_LOG_VERBOSE, "dash_seek with SegmentTimeline end cur_seq_no[%"PRId64"].\n",
                (int64_t)pls->cur_seq_no);
     } else if (pls->fragment_duration > 0) {
-        pls->cur_seq_no = pls->first_seq_no + ((seek_pos_msec * pls->fragment_timescale) / pls->fragment_duration) / 1000;
+        pls->cur_seq_no = av_sat_add64(pls->first_seq_no,
+            av_rescale_rnd(seek_pos_msec, pls->fragment_timescale, 1000, AV_ROUND_DOWN) /
+            pls->fragment_duration);
     } else {
         av_log(pls->parent, AV_LOG_ERROR, "dash_seek missing timeline or fragment_duration\n");
         pls->cur_seq_no = pls->first_seq_no;
@@ -3213,8 +3255,9 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
 {
     int ret = 0, i;
     DASHContext *c = s->priv_data;
-    int64_t seek_pos_msec = av_rescale_rnd(timestamp, 1000,
-                                           s->streams[stream_index]->time_base.den,
+    int64_t seek_pos_msec = av_rescale_q_rnd(timestamp,
+                                           s->streams[stream_index]->time_base,
+                                           (AVRational){1, 1000},
                                            flags & AVSEEK_FLAG_BACKWARD ?
                                            AV_ROUND_DOWN : AV_ROUND_UP);
     if ((flags & AVSEEK_FLAG_BYTE))

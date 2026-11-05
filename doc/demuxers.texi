@@ -274,6 +274,11 @@ which streams to actually receive.
 Each stream mirrors the @code{id} and @code{bandwidth} properties from the
 @code{<Representation>} as metadata keys named "id" and "variant_bitrate" respectively.
 
+For live media fragments, transient open failures (including HTTP 404 and 5xx)
+are retried at most twice, with interruptible 400 millisecond waits. VOD,
+initialization sections, and permanent errors such as HTTP 401/403 are not
+retried by this recovery path.
+
 @subsection Options
 
 This demuxer accepts the following option:
