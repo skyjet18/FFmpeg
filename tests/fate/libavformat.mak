@@ -37,6 +37,11 @@ fate-mpegtsenc: libavformat/tests/mpegtsenc$(EXESUF)
 fate-mpegtsenc: CMD = run libavformat/tests/mpegtsenc$(EXESUF)
 fate-mpegtsenc: CMP = null
 
+FATE_LIBAVFORMAT-$(call ALLYES, MPEGTS_MUXER MPEGTS_DEMUXER) += fate-mpegts-probe
+fate-mpegts-probe: libavformat/tests/mpegts_probe$(EXESUF)
+fate-mpegts-probe: CMD = run libavformat/tests/mpegts_probe$(EXESUF)
+fate-mpegts-probe: CMP = null
+
 FATE_LIBAVFORMAT-$(CONFIG_HLS_DEMUXER) += fate-hls-selection
 fate-hls-selection: libavformat/tests/hls_selection$(EXESUF)
 fate-hls-selection: CMD = run libavformat/tests/hls_selection$(EXESUF)
