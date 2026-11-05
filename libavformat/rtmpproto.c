@@ -2660,7 +2660,7 @@ static int inject_fake_duration_metadata(RTMPContext *rt)
 static int rtmp_open(URLContext *s, const char *uri, int flags, AVDictionary **opts)
 {
     RTMPContext *rt = s->priv_data;
-    char proto[8], hostname[256], path[1024], auth[100], *fname;
+    char *proto, tmpProto[10], hostname[256], path[1024], auth[100], *fname;
     char *old_app, *qmark, *n, fname_buffer[1024];
     uint8_t buf[2048];
     int port;
@@ -2671,7 +2671,9 @@ static int rtmp_open(URLContext *s, const char *uri, int flags, AVDictionary **o
 
     rt->is_input = !(flags & AVIO_FLAG_WRITE);
 
-    av_url_split(proto, sizeof(proto), auth, sizeof(auth),
+    memset(tmpProto, 0, sizeof(tmpProto));
+    proto = &tmpProto[2];
+    av_url_split(tmpProto, sizeof(tmpProto), auth, sizeof(auth),
                  hostname, sizeof(hostname), &port,
                  path, sizeof(path), s->filename);
 
@@ -3221,9 +3223,9 @@ const URLProtocol ff_##flavor##_protocol = {     \
 #define RTMP_PROTOCOL(flavor, uppercase)         \
     RTMP_PROTOCOL_3(flavor, CONFIG_ ## uppercase ## _PROTOCOL)
 
-RTMP_PROTOCOL(rtmp,   RTMP)
-RTMP_PROTOCOL(rtmpe,  RTMPE)
-RTMP_PROTOCOL(rtmps,  RTMPS)
-RTMP_PROTOCOL(rtmpt,  RTMPT)
-RTMP_PROTOCOL(rtmpte, RTMPTE)
-RTMP_PROTOCOL(rtmpts, RTMPTS)
+RTMP_PROTOCOL(ffrtmp,   FFRTMP)
+RTMP_PROTOCOL(ffrtmpe,  FFRTMPE)
+RTMP_PROTOCOL(ffrtmps,  FFRTMPS)
+RTMP_PROTOCOL(ffrtmpt,  FFRTMPT)
+RTMP_PROTOCOL(ffrtmpte, FFRTMPTE)
+RTMP_PROTOCOL(ffrtmpts, FFRTMPTS)
