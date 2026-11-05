@@ -64,5 +64,21 @@ int main(void)
     /* Manifest-known subtitles may still be unprobed DATA/NONE streams. */
     discard_initial_subtitles(&c);
     av_assert0(subtitle.discard == AVDISCARD_ALL);
+    {
+        struct representation fixed = {.fragment_duration = 3840, .fragment_timescale = 1000,
+                                        .first_seq_no = 100};
+        c.suggested_presentation_delay = 0;
+        av_assert0(duration_live_delay(&c, &fixed) == 16);
+        c.suggested_presentation_delay = 24;
+        av_assert0(duration_live_delay(&c, &fixed) == 24);
+        c.live_delay = 5;
+        av_assert0(duration_live_delay(&c, &fixed) == 5);
+        c.live_delay = c.suggested_presentation_delay = 0;
+        c.is_startover = 0;
+        c.availability_start_time = get_current_time_in_sec() - 120;
+        av_assert0(calc_cur_seg_no(&s, &fixed) == 127);
+        c.availability_start_time = get_current_time_in_sec() + 5;
+        av_assert0(calc_cur_seg_no(&s, &fixed) == 100);
+    }
     return 0;
 }

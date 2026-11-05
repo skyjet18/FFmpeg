@@ -1692,6 +1692,16 @@ static int64_t calc_common_live_start(DASHContext *c)
     return FFMIN(latest, FFMIN(edge - 1, FFMAX(edge - delay * AV_TIME_BASE, earliest)));
 }
 
+static int64_t duration_live_delay(DASHContext *c, struct representation *pls)
+{
+    if (c->live_delay > 0)
+        return c->live_delay;
+    if (c->suggested_presentation_delay > 0)
+        return c->suggested_presentation_delay;
+    return FFMAX(live_delay(c), av_rescale_rnd(4, pls->fragment_duration,
+                                              pls->fragment_timescale, AV_ROUND_UP));
+}
+
 static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
 {
     DASHContext *c = s->priv_data;
@@ -1734,7 +1744,11 @@ static int64_t calc_cur_seg_no(AVFormatContext *s, struct representation *pls)
                     num = pls->first_seq_no + (((c->publish_time - c->time_shift_buffer_depth + pls->fragment_duration) - c->suggested_presentation_delay) * pls->fragment_timescale) / pls->fragment_duration;
                 }
             } else {
-                num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time) - c->suggested_presentation_delay) * pls->fragment_timescale) / pls->fragment_duration;
+                int64_t elapsed = get_current_time_in_sec() - c->availability_start_time;
+                int64_t delay = duration_live_delay(c, pls);
+                elapsed = elapsed > delay ? elapsed - delay : 0;
+                num = pls->first_seq_no + av_rescale_rnd(elapsed, pls->fragment_timescale,
+                                                       pls->fragment_duration, AV_ROUND_DOWN);
             }
         }
     } else {
