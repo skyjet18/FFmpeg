@@ -753,6 +753,7 @@ TESTPROGS-$(CONFIG_FFRTMPCRYPT_PROTOCOL) += rtmpdh
 TESTPROGS-$(CONFIG_MOV_MUXER)            += movenc
 TESTPROGS-$(CONFIG_MPEGTS_MUXER)         += mpegtsenc
 TESTPROGS-$(CONFIG_HLS_DEMUXER)          += hls_selection
+TESTPROGS-$(CONFIG_MPEGTS_DEMUXER)       += mpegts_probe
 TESTPROGS-$(CONFIG_NETWORK)              += noproxy
 TESTPROGS-$(CONFIG_SRTP)                 += srtp
 TESTPROGS-$(CONFIG_IMF_DEMUXER)          += imf
