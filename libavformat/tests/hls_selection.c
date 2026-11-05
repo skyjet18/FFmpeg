@@ -2,6 +2,146 @@
 #include "libavutil/avassert.h"
 #include "../hls.c"
 
+static AVStream *test_stream(AVFormatContext *s, int id, enum AVMediaType type,
+                            enum AVCodecID codec)
+{
+    AVStream *stream = avformat_new_stream(s, NULL);
+    av_assert0(stream);
+    stream->id = id;
+    stream->codecpar->codec_type = type;
+    stream->codecpar->codec_id = codec;
+    stream->time_base = (AVRational){1, 90000};
+    return stream;
+}
+
+static void test_stream_mapping(void)
+{
+    HLSContext c = {0};
+    AVFormatContext *s = avformat_alloc_context();
+    struct playlist pls = {.ctx = avformat_alloc_context()};
+    AVStream *audio, *video, *data;
+    AVStream *first = test_stream(pls.ctx, 100, AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
+    AVStream *second = test_stream(pls.ctx, 200, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_MPEG2VIDEO);
+    s->priv_data = &c;
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    audio = pls.main_streams[0];
+    video = pls.main_streams[1];
+    video->discard = AVDISCARD_DEFAULT;
+    audio->discard = AVDISCARD_ALL;
+    /* A video-only ad occupies the old audio index and adds ID3 in the video slot. */
+    first->id = 200;
+    first->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    first->codecpar->codec_id = AV_CODEC_ID_MPEG2VIDEO;
+    second->id = 300;
+    second->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+    second->codecpar->codec_id = AV_CODEC_ID_TIMED_ID3;
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    av_assert0(pls.main_streams[0] == video && video->discard == AVDISCARD_DEFAULT);
+    av_assert0(pls.main_streams[1] != audio && pls.main_streams[1] != video);
+    data = pls.main_streams[1];
+    av_assert0(data->codecpar->codec_type == AVMEDIA_TYPE_DATA);
+    av_assert0(audio->codecpar->codec_type == AVMEDIA_TYPE_AUDIO);
+    {
+        struct segment segment = {.duration = 10000000};
+        struct segment *segments[] = {&segment};
+        struct playlist *playlists[] = {&pls};
+        c.ctx = s;
+        c.first_timestamp = 0;
+        c.n_playlists = 1;
+        c.playlists = playlists;
+        pls.parent = s;
+        pls.segments = segments;
+        pls.n_segments = 1;
+        pls.pkt = av_packet_alloc();
+        av_assert0(pls.pkt && av_new_program(s, 0));
+        av_program_add_stream_index(s, 0, audio->index);
+        audio->discard = AVDISCARD_DEFAULT;
+        video->discard = data->discard = AVDISCARD_ALL;
+        /* An absent selected track must neither stop the playlist nor block seeks. */
+        av_assert0(playlist_needed(&pls));
+        av_assert0(!hls_read_seek(s, audio->index, 0, AVSEEK_FLAG_ANY));
+        av_assert0(pls.seek_stream_index == audio->index);
+        audio->discard = AVDISCARD_ALL;
+        av_assert0(!playlist_needed(&pls));
+        av_packet_free(&pls.pkt);
+        c.n_playlists = 0;
+    }
+    /* Returning to the original layout must recover the same selected slots. */
+    first->id = 100;
+    first->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    first->codecpar->codec_id = AV_CODEC_ID_AAC;
+    second->id = 200;
+    second->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+    second->codecpar->codec_id = AV_CODEC_ID_MPEG2VIDEO;
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    av_assert0(pls.main_streams[0] == audio && pls.main_streams[1] == video);
+    /* Two audio identities must never collapse to the first audio stream. */
+    second->id = 101;
+    second->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    second->codecpar->codec_id = AV_CODEC_ID_AAC;
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    av_assert0(pls.main_streams[0] == audio && pls.main_streams[1] != audio);
+    {
+        AVStream *other_audio = pls.main_streams[1];
+        first->id = 101;
+        second->id = 100;
+        av_assert0(!update_streams_from_subdemuxer(s, &pls));
+        av_assert0(pls.main_streams[0] == other_audio && pls.main_streams[1] == audio);
+        first->id = 102; /* Exactly one unmatched incoming and stored audio. */
+        av_assert0(!update_streams_from_subdemuxer(s, &pls));
+        av_assert0(pls.main_streams[0] == other_audio && pls.main_streams[1] == audio);
+    }
+    av_free(pls.main_streams);
+    av_free(pls.associated_streams);
+    avformat_free_context(pls.ctx);
+    s->priv_data = NULL;
+    avformat_free_context(s);
+}
+
+static void test_stream_mapping_edges(void)
+{
+    HLSContext c = {0};
+    AVFormatContext *s = avformat_alloc_context();
+    struct playlist pls = {.ctx = avformat_alloc_context()};
+    AVStream *first = test_stream(pls.ctx, 0, AVMEDIA_TYPE_UNKNOWN, AV_CODEC_ID_NONE);
+    AVStream *second = test_stream(pls.ctx, 0, AVMEDIA_TYPE_UNKNOWN, AV_CODEC_ID_NONE);
+    AVStream *a, *b;
+    s->priv_data = &c;
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    a = pls.main_streams[0];
+    b = pls.main_streams[1];
+    av_assert0(a != b);
+    /* No usable IDs: retain positional identities as codecs become known. */
+    first->codecpar->codec_type = second->codecpar->codec_type = AVMEDIA_TYPE_AUDIO;
+    first->codecpar->codec_id = second->codecpar->codec_id = AV_CODEC_ID_AAC;
+    a->discard = AVDISCARD_ALL;
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    av_assert0(pls.main_streams[0] == a && pls.main_streams[1] == b);
+    av_assert0(a->codecpar->codec_id == AV_CODEC_ID_AAC && a->discard == AVDISCARD_ALL);
+    first->codecpar->codec_id = AV_CODEC_ID_MP3;
+    first->time_base = (AVRational){1, 48000};
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    av_assert0(pls.main_streams[0] == a && a->codecpar->codec_id == AV_CODEC_ID_MP3);
+    av_assert0(a->time_base.den == 48000 && a->discard == AVDISCARD_ALL);
+    /* Two changed PIDs are ambiguous: allocate two distinct new identities. */
+    first->id = 10;
+    second->id = 20;
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    av_assert0(pls.main_streams[0] != a && pls.main_streams[0] != b);
+    av_assert0(pls.main_streams[1] != a && pls.main_streams[1] != b);
+    av_assert0(pls.main_streams[0] != pls.main_streams[1]);
+    /* Returning duplicate IDs are still ambiguous: do not guess an old selection. */
+    first->id = second->id = 0;
+    av_assert0(!update_streams_from_subdemuxer(s, &pls));
+    av_assert0(pls.main_streams[0] != pls.main_streams[1]);
+    av_assert0(pls.main_streams[0] != a && pls.main_streams[1] != b);
+    av_free(pls.main_streams);
+    av_free(pls.associated_streams);
+    avformat_free_context(pls.ctx);
+    s->priv_data = NULL;
+    avformat_free_context(s);
+}
+
 int main(void)
 {
     struct playlist low = {0}, high = {0}, audio[140];
@@ -17,6 +157,8 @@ int main(void)
                     .n_renditions = 140, .renditions = rendition_ptrs};
     int i;
 
+    test_stream_mapping();
+    test_stream_mapping_edges();
     memset(audio, 0, sizeof(audio));
     av_strlcpy(low_var.audio_group, "audio", sizeof(low_var.audio_group));
     av_strlcpy(high_var.audio_group, "audio", sizeof(high_var.audio_group));

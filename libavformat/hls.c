@@ -100,6 +100,11 @@ enum PlaylistType {
  * it has an open AVIOContext too, and potentially an AVPacket
  * containing the next packet from this stream.
  */
+struct hls_stream {
+    AVStream *stream;
+    int id;
+};
+
 struct playlist {
     char url[MAX_URL_SIZE];
     FFIOContext pb;
@@ -119,6 +124,8 @@ struct playlist {
      * indexed by the subdemuxer stream indexes */
     AVStream **main_streams;
     int n_main_streams;
+    struct hls_stream *associated_streams;
+    int n_associated_streams;
 
     int finished;
     enum PlaylistType type;
@@ -166,7 +173,7 @@ struct playlist {
 
     int64_t seek_timestamp;
     int seek_flags;
-    int seek_stream_index; /* into subdemuxer stream array */
+    int seek_stream_index; /* into main demuxer stream array */
 
     /* Renditions associated with this playlist, if any.
      * Alternative rendition playlists have a single rendition associated
@@ -285,6 +292,7 @@ static void free_playlist_list(HLSContext *c)
         free_segment_list(pls);
         free_init_section_list(pls);
         av_freep(&pls->main_streams);
+        av_freep(&pls->associated_streams);
         av_freep(&pls->renditions);
         av_freep(&pls->id3_buf);
         av_dict_free(&pls->id3_initial);
@@ -1607,12 +1615,12 @@ static int playlist_needed(struct playlist *pls)
     int first_st;
 
     /* If there is no context or streams yet, the playlist is needed */
-    if (!pls->ctx || !pls->n_main_streams)
+    if (!pls->ctx || !pls->n_associated_streams)
         return 1;
 
     /* check if any of the streams in the playlist are needed */
-    for (i = 0; i < pls->n_main_streams; i++) {
-        if (pls->main_streams[i]->discard < AVDISCARD_ALL) {
+    for (i = 0; i < pls->n_associated_streams; i++) {
+        if (pls->associated_streams[i].stream->discard < AVDISCARD_ALL) {
             stream_needed = 1;
             break;
         }
@@ -1627,7 +1635,7 @@ static int playlist_needed(struct playlist *pls)
      * discarded. Since all streams in the playlist are part of the same programs
      * we can just check the programs of the first stream. */
 
-    first_st = pls->main_streams[0]->index;
+    first_st = pls->associated_streams[0].stream->index;
 
     for (i = 0; i < s->nb_programs; i++) {
         AVProgram *program = s->programs[i];
@@ -2179,30 +2187,118 @@ static int set_stream_info_from_input_stream(AVStream *st, struct playlist *pls,
     return 0;
 }
 
-/* add new subdemuxer streams to our context, if any */
+static int compatible_stream_type(const AVStream *st, const AVStream *ist)
+{
+    return st->codecpar->codec_type == ist->codecpar->codec_type ||
+           st->codecpar->codec_id == AV_CODEC_ID_NONE;
+}
+
+/* Preserve identities when a discontinuity changes the subdemuxer's layout. */
 static int update_streams_from_subdemuxer(AVFormatContext *s, struct playlist *pls)
 {
-    int err;
+    AVStream **mapping;
+    uint8_t *used;
+    unsigned int i, j;
+    int err, unchanged = pls->n_main_streams == pls->ctx->nb_streams;
 
-    while (pls->n_main_streams < pls->ctx->nb_streams) {
-        int ist_idx = pls->n_main_streams;
-        AVStream *st = avformat_new_stream(s, NULL);
-        AVStream *ist = pls->ctx->streams[ist_idx];
-
-        if (!st)
-            return AVERROR(ENOMEM);
-
-        st->id = pls->index;
-        dynarray_add(&pls->main_streams, &pls->n_main_streams, st);
-
-        add_stream_to_programs(s, pls, st);
-
-        err = set_stream_info_from_input_stream(st, pls, ist);
-        if (err < 0)
-            return err;
+    if (unchanged) {
+        for (i = 0; i < pls->ctx->nb_streams; i++) {
+            AVStream *ist = pls->ctx->streams[i];
+            for (j = 0; j < pls->n_associated_streams; j++)
+                if (pls->associated_streams[j].stream == pls->main_streams[i])
+                    break;
+            if (j == pls->n_associated_streams ||
+                pls->associated_streams[j].id != ist->id ||
+                pls->main_streams[i]->codecpar->codec_type != ist->codecpar->codec_type ||
+                pls->main_streams[i]->codecpar->codec_id != ist->codecpar->codec_id ||
+                (!pls->is_id3_timestamped &&
+                 av_cmp_q(pls->main_streams[i]->time_base, ist->time_base))) {
+                unchanged = 0;
+                break;
+            }
+        }
+        if (unchanged)
+            return 0;
+    }
+    mapping = av_calloc(pls->ctx->nb_streams, sizeof(*mapping));
+    used = av_calloc(pls->n_associated_streams + 1, 1);
+    if (!mapping || !used) {
+        av_free(mapping);
+        av_free(used);
+        return AVERROR(ENOMEM);
     }
 
+    /* Match explicit identities before considering any media-type fallback. */
+    for (i = 0; i < pls->ctx->nb_streams; i++) {
+        AVStream *ist = pls->ctx->streams[i];
+        int match = -1;
+        for (j = 0; j < pls->n_associated_streams; j++) {
+            struct hls_stream *entry = &pls->associated_streams[j];
+            if (used[j] || entry->id != ist->id || !compatible_stream_type(entry->stream, ist))
+                continue;
+            if (i < pls->n_main_streams && entry->stream == pls->main_streams[i]) {
+                match = j;
+                break;
+            }
+            match = match == -1 ? j : -2;
+        }
+        if (match >= 0) {
+            mapping[i] = pls->associated_streams[match].stream;
+            used[match] = 1;
+        }
+    }
+
+    for (i = 0; i < pls->ctx->nb_streams; i++) {
+        AVStream *ist = pls->ctx->streams[i];
+        int match = -1, incoming = 0;
+        if (mapping[i])
+            continue;
+        for (j = 0; j < pls->ctx->nb_streams; j++)
+            incoming += !mapping[j] &&
+                        pls->ctx->streams[j]->codecpar->codec_type == ist->codecpar->codec_type;
+        for (j = 0; j < pls->n_associated_streams; j++)
+            if (!used[j] &&
+                pls->associated_streams[j].stream->codecpar->codec_type == ist->codecpar->codec_type)
+                match = match == -1 ? j : -2;
+        if (incoming == 1 && match >= 0) {
+            mapping[i] = pls->associated_streams[match].stream;
+            pls->associated_streams[match].id = ist->id;
+            used[match] = 1;
+        }
+    }
+
+    for (i = 0; i < pls->ctx->nb_streams; i++) {
+        AVStream *ist = pls->ctx->streams[i];
+        if (!mapping[i]) {
+            struct hls_stream entry;
+            mapping[i] = avformat_new_stream(s, NULL);
+            if (!mapping[i]) {
+                err = AVERROR(ENOMEM);
+                goto fail;
+            }
+            mapping[i]->id = pls->index;
+            entry = (struct hls_stream){.stream = mapping[i], .id = ist->id};
+            if (!av_dynarray2_add((void **)&pls->associated_streams, &pls->n_associated_streams,
+                                 sizeof(entry), (const uint8_t *)&entry)) {
+                err = AVERROR(ENOMEM);
+                goto fail;
+            }
+            add_stream_to_programs(s, pls, mapping[i]);
+        }
+
+        err = set_stream_info_from_input_stream(mapping[i], pls, ist);
+        if (err < 0)
+            goto fail;
+    }
+    av_free(pls->main_streams);
+    pls->main_streams = mapping;
+    pls->n_main_streams = pls->ctx->nb_streams;
+    av_free(used);
     return 0;
+fail:
+    av_free(mapping);
+    av_free(used);
+    return err;
 }
 
 static void update_noheader_flag(AVFormatContext *s)
@@ -2759,8 +2855,13 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                 if (pls->seek_timestamp == AV_NOPTS_VALUE)
                     break;
 
+                ret = update_streams_from_subdemuxer(s, pls);
+                if (ret < 0) {
+                    av_packet_unref(pls->pkt);
+                    return ret;
+                }
                 if (pls->seek_stream_index < 0 ||
-                    pls->seek_stream_index == pls->pkt->stream_index) {
+                    pls->seek_stream_index == pls->main_streams[pls->pkt->stream_index]->index) {
 
                     if (pls->pkt->dts == AV_NOPTS_VALUE) {
                         pls->seek_timestamp = AV_NOPTS_VALUE;
@@ -2848,7 +2949,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
 
         /* There may be more situations where this would be useful, but this at least
          * handles newly probed codecs properly (i.e. request_probe by mpegts). */
-        if (ist->codecpar->codec_id != st->codecpar->codec_id) {
+        if (ist->codecpar->codec_id != st->codecpar->codec_id ||
+            ist->codecpar->codec_type != st->codecpar->codec_type) {
             ret = set_stream_info_from_input_stream(st, pls, ist);
             if (ret < 0) {
                 return ret;
@@ -2866,7 +2968,6 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     HLSContext *c = s->priv_data;
     struct playlist *seek_pls = NULL;
     int i, j;
-    int stream_subdemuxer_index;
     int64_t first_timestamp, seek_timestamp, duration;
     int64_t seq_no, seg_start_ts;
 
@@ -2889,10 +2990,9 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     /* find the playlist with the specified stream */
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
-        for (j = 0; j < pls->n_main_streams; j++) {
-            if (pls->main_streams[j] == s->streams[stream_index]) {
+        for (j = 0; j < pls->n_associated_streams; j++) {
+            if (pls->associated_streams[j].stream == s->streams[stream_index]) {
                 seek_pls = pls;
-                stream_subdemuxer_index = j;
                 break;
             }
         }
@@ -2911,7 +3011,7 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
 
     /* set segment now so we do not need to search again below */
     seek_pls->cur_seq_no = seq_no;
-    seek_pls->seek_stream_index = stream_subdemuxer_index;
+    seek_pls->seek_stream_index = stream_index;
 
     for (i = 0; i < c->n_playlists; i++) {
         /* Reset reading */
