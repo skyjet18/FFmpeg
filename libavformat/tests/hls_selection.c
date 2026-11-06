@@ -52,10 +52,16 @@ static void test_stream_mapping(void)
     {
         struct segment segment = {.duration = 10000000};
         struct segment *segments[] = {&segment};
-        struct playlist *playlists[] = {&pls};
+        /* Playlists a seek has to leave alone: excluded by the preselection
+         * (never loaded), broken, without segments. They have no packet. */
+        struct playlist excluded = {.excluded = 1}, broken = {.broken = 1}, empty = {0};
+        struct playlist *playlists[] = {&excluded, &pls, &broken, &empty};
+        excluded.seek_timestamp = broken.seek_timestamp = empty.seek_timestamp = AV_NOPTS_VALUE;
+        excluded.segments = broken.segments = segments;
+        excluded.n_segments = broken.n_segments = 1;
         c.ctx = s;
         c.first_timestamp = 0;
-        c.n_playlists = 1;
+        c.n_playlists = 4;
         c.playlists = playlists;
         pls.parent = s;
         pls.segments = segments;
@@ -69,6 +75,10 @@ static void test_stream_mapping(void)
         av_assert0(playlist_needed(&pls));
         av_assert0(!hls_read_seek(s, audio->index, 0, AVSEEK_FLAG_ANY));
         av_assert0(pls.seek_stream_index == audio->index);
+        av_assert0(pls.seek_timestamp == 0 &&
+                   excluded.seek_timestamp == AV_NOPTS_VALUE &&
+                   broken.seek_timestamp == AV_NOPTS_VALUE &&
+                   empty.seek_timestamp == AV_NOPTS_VALUE);
         audio->discard = AVDISCARD_ALL;
         av_assert0(!playlist_needed(&pls));
         av_packet_free(&pls.pkt);

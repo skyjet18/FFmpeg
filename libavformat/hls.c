@@ -3703,6 +3703,10 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Reset reading */
         struct playlist *pls = c->playlists[i];
 
+        /* nothing is read from these, and they have no current segment */
+        if (pls->excluded || pls->broken || !pls->n_segments)
+            continue;
+
         reset_playlist(pls);
 
         /* The discard in hls_read_packet compares this playlist's packet DTS
