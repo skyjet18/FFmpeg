@@ -123,6 +123,8 @@ struct representation {
     int64_t seek_pos_msec;
     int seek_flags;
     int seek_pending;
+    int drop_pending;
+    int64_t drop_target; /* Normalized media time in 90-kHz ticks. */
     int is_restart_needed;
     int input_read_done; /* segment read to its end, connection still usable */
     int input_reuse;     /* demuxer restarted: send the next request on that connection */
@@ -2677,11 +2679,9 @@ static int recheck_discard_flags(AVFormatContext *s, struct representation **p, 
                  (!c->is_live && pls->n_fragments == 1))) {
                 /* Sequence numbers are representation-local; align by media time. */
                 int64_t position = av_rescale(c->cur_timestamp, 1000, 90000);
-                ret = dash_seek(s, pls, position, 0, 1);
+                ret = dash_seek(s, pls, position, AVSEEK_FLAG_BACKWARD, 1);
                 if (ret < 0)
                     return ret;
-                if (pls->n_fragments != 1)
-                    pls->seek_pending = 1;
             } else {
                 for (j = 0; j < n; j++)
                     pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
@@ -2695,6 +2695,10 @@ static int recheck_discard_flags(AVFormatContext *s, struct representation **p, 
                         pls->seek_pending = 1;
                     }
                 }
+            }
+            if (pls->type == AVMEDIA_TYPE_AUDIO && c->cur_timestamp != AV_NOPTS_VALUE) {
+                pls->drop_pending = 1;
+                pls->drop_target = c->cur_timestamp;
             }
             ret = reopen_demux_for_component(s, pls);
             if (ret < 0)
@@ -2714,21 +2718,19 @@ static int dash_drop_packet_before_seek_target(struct representation *rep,
                                                AVRational time_base)
 {
     int64_t packet_timestamp;
-    int64_t target_timestamp;
-
-    if (!rep->seek_pending)
+    if (!rep->drop_pending)
         return 0;
     if (pkt->pts == AV_NOPTS_VALUE) {
-        rep->seek_pending = 0;
-        return 0;
+        av_log(rep->parent, AV_LOG_ERROR,
+               "Cannot align reactivated DASH audio without a packet PTS\n");
+        return AVERROR_INVALIDDATA;
     }
 
     packet_timestamp = av_rescale_q(pkt->pts, time_base, (AVRational){1, 90000});
-    target_timestamp = av_rescale(rep->seek_pos_msec, 90, 1);
-    if (packet_timestamp < target_timestamp)
+    if (packet_timestamp < rep->drop_target)
         return 1;
 
-    rep->seek_pending = 0;
+    rep->drop_pending = 0;
     return 0;
 }
 
@@ -2804,12 +2806,16 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
                 }
             }
 
-            if (cur->type == AVMEDIA_TYPE_AUDIO && cur->n_fragments != 1 &&
-                dash_drop_packet_before_seek_target(cur, pkt,
-                                                     cur->ctx->streams[0]->time_base)) {
-                av_packet_unref(pkt);
-                ret = 0;
-                continue;
+            if (cur->type == AVMEDIA_TYPE_AUDIO) {
+                int drop = dash_drop_packet_before_seek_target(cur, pkt,
+                                            cur->ctx->streams[0]->time_base);
+                if (drop) {
+                    av_packet_unref(pkt);
+                    if (drop < 0)
+                        return drop;
+                    ret = 0;
+                    continue;
+                }
             }
 
             /* If we got a packet, return it */
@@ -2854,6 +2860,7 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
     int j = 0;
     int64_t duration = 0;
 
+    pls->drop_pending = 0;
     av_log(pls->parent, AV_LOG_VERBOSE, "DASH seek pos[%"PRId64"ms] %s\n",
            seek_pos_msec, dry_run ? " (dry)" : "");
 
