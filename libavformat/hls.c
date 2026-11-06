@@ -131,6 +131,7 @@ struct playlist {
     enum PlaylistType type;
     int64_t target_duration;
     int64_t start_seq_no;
+    int64_t window_start_offset; /* Duration removed from this playlist's initial window. */
     int time_offset_flag;
     int64_t start_time_offset;
     int n_segments;
@@ -1159,16 +1160,17 @@ static int parse_playlist(HLSContext *c, const char *url,
     }
     if (prev_segments) {
         if (pls->start_seq_no > prev_start_seq_no && c->first_timestamp != AV_NOPTS_VALUE) {
-            int64_t prev_timestamp = c->first_timestamp;
+            int64_t prev_offset = pls->window_start_offset;
             int i;
             int64_t diff = pls->start_seq_no - prev_start_seq_no;
             for (i = 0; i < prev_n_segments && i < diff; i++) {
-                c->first_timestamp += prev_segments[i]->duration;
+                pls->window_start_offset = av_sat_add64(pls->window_start_offset,
+                                                       prev_segments[i]->duration);
             }
             av_log(c->ctx, AV_LOG_DEBUG, "Media sequence change (%"PRId64" -> %"PRId64")"
-                   " reflected in first_timestamp: %"PRId64" -> %"PRId64"\n",
+                   " reflected in playlist offset: %"PRId64" -> %"PRId64"\n",
                    prev_start_seq_no, pls->start_seq_no,
-                   prev_timestamp, c->first_timestamp);
+                   prev_offset, pls->window_start_offset);
         } else if (pls->start_seq_no < prev_start_seq_no) {
             av_log(c->ctx, AV_LOG_WARNING, "Media sequence changed unexpectedly: %"PRId64" -> %"PRId64"\n",
                    prev_start_seq_no, pls->start_seq_no);
@@ -2045,6 +2047,7 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
     int64_t pos = c->first_timestamp == AV_NOPTS_VALUE ?
                   0 : c->first_timestamp;
 
+    pos = av_sat_add64(pos, pls->window_start_offset);
     if (timestamp < pos) {
         *seq_no = pls->start_seq_no;
         return 0;
@@ -2680,6 +2683,28 @@ static int hls_read_header(AVFormatContext *s)
     return 0;
 }
 
+static void reset_playlist(struct playlist *pls)
+{
+    AVIOContext *pb = &pls->pb.pub;
+
+    ff_format_io_close(pls->parent, &pls->input);
+    pls->input_read_done = 0;
+    ff_format_io_close(pls->parent, &pls->input_next);
+    pls->input_next_requested = 0;
+    av_packet_unref(pls->pkt);
+    pb->eof_reached = 0;
+    pb->error = 0;
+    pb->buf_end = pb->buf_ptr = pb->buffer;
+    /* Let the nested MPEG-TS/MOV demuxer detect the changed position. */
+    pb->pos = 0;
+    if (pls->ctx)
+        ff_read_frame_flush(pls->ctx);
+    if (pls->is_subtitle)
+        avformat_close_input(&pls->ctx);
+    pls->cur_init_section = NULL;
+    pls->discontinuity_pending = 0;
+}
+
 static int recheck_discard_flags(AVFormatContext *s, int first)
 {
     HLSContext *c = s->priv_data;
@@ -2696,12 +2721,17 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             continue;
         }
         if (cur_needed && !pls->needed) {
+            struct segment *seg;
+
             pls->needed = 1;
             changed = 1;
             pls->cur_seq_no = select_cur_seq_no(c, pls);
+            reset_playlist(pls);
+            seg = current_segment(pls);
+            if (seg)
+                pls->active_discontinuity_sequence = seg->discontinuity_sequence;
             pls->discontinuity_start_seq_no = pls->cur_seq_no;
             pls->discontinuity_offset = AV_NOPTS_VALUE;
-            pls->pb.pub.eof_reached = 0;
             if (c->cur_timestamp != AV_NOPTS_VALUE) {
                 /* catch up */
                 pls->seek_timestamp = c->cur_timestamp;
@@ -2772,10 +2802,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
     HLSContext *c = s->priv_data;
     int ret, i, minplaylist = -1;
 
-    if (c->first_packet) {
-        recheck_discard_flags(s, 1);
-        c->first_packet = 0;
-    }
+    recheck_discard_flags(s, c->first_packet);
+    c->first_packet = 0;
 
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
@@ -2823,7 +2851,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                         pls->pkt->dts != AV_NOPTS_VALUE) {
                         int64_t raw_timestamp = av_rescale_q(pls->pkt->dts,
                             get_timebase(pls), AV_TIME_BASE_Q);
-                        int64_t presentation_timestamp = av_sat_add64(c->first_timestamp,
+                        int64_t presentation_timestamp = av_sat_add64(
+                            av_sat_add64(c->first_timestamp, pls->window_start_offset),
                             segment_start_time(pls, pls->discontinuity_start_seq_no));
 
                         pls->discontinuity_offset = av_sat_sub64(presentation_timestamp,
@@ -3018,26 +3047,7 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     for (i = 0; i < c->n_playlists; i++) {
         /* Reset reading */
         struct playlist *pls = c->playlists[i];
-        AVIOContext *const pb = &pls->pb.pub;
-        ff_format_io_close(pls->parent, &pls->input);
-        pls->input_read_done = 0;
-        ff_format_io_close(pls->parent, &pls->input_next);
-        pls->input_next_requested = 0;
-        av_packet_unref(pls->pkt);
-        pb->eof_reached = 0;
-        /* Clear any buffered data */
-        pb->buf_end = pb->buf_ptr = pb->buffer;
-        /* Reset the pos, to let the mpegts/mov demuxer know we've seeked. */
-        pb->pos = 0;
-        /* Flush the packet queue of the subdemuxer. */
-        if (pls->ctx)
-            ff_read_frame_flush(pls->ctx);
-
-        if (pls->is_subtitle)
-            avformat_close_input(&pls->ctx);
-
-        /* Reset the init segment so it's re-fetched and served appropiately */
-        pls->cur_init_section = NULL;
+        reset_playlist(pls);
 
         pls->seek_timestamp = seek_timestamp;
         pls->seek_flags = flags;

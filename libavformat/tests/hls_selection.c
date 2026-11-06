@@ -142,6 +142,93 @@ static void test_stream_mapping_edges(void)
     avformat_free_context(s);
 }
 
+static void test_reactivation(void)
+{
+    HLSContext c = {.first_timestamp = 1000000, .cur_timestamp = 7500000};
+    AVFormatContext *s = avformat_alloc_context();
+    struct segment segment = {.duration = 2000000, .discontinuity_sequence = 4};
+    struct segment *segments[] = {&segment, &segment, &segment, &segment};
+    struct playlist embedded = {.ctx = avformat_alloc_context(), .needed = 1};
+    struct playlist alternate = {.ctx = avformat_alloc_context(), .needed = 1,
+        .finished = 1, .segments = segments, .n_segments = 4};
+    struct playlist *playlists[] = {&embedded, &alternate};
+    AVStream *video, *audio, *other;
+
+    av_assert0(s && embedded.ctx && alternate.ctx);
+    c.ctx = s;
+    c.playlists = playlists;
+    c.n_playlists = 2;
+    s->priv_data = &c;
+    embedded.parent = alternate.parent = s;
+    test_stream(embedded.ctx, 100, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_MPEG2VIDEO);
+    test_stream(embedded.ctx, 101, AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
+    test_stream(alternate.ctx, 100, AVMEDIA_TYPE_AUDIO, AV_CODEC_ID_AAC);
+    av_assert0(!update_streams_from_subdemuxer(s, &embedded));
+    av_assert0(!update_streams_from_subdemuxer(s, &alternate));
+    video = embedded.main_streams[0];
+    audio = embedded.main_streams[1];
+    other = alternate.main_streams[0];
+    av_assert0(av_new_program(s, 0));
+    for (unsigned i = 0; i < s->nb_streams; i++)
+        av_program_add_stream_index(s, 0, i);
+    other->discard = AVDISCARD_ALL;
+    av_assert0(recheck_discard_flags(s, 1) == 1 && !alternate.needed);
+    alternate.pkt = av_packet_alloc();
+    av_assert0(alternate.pkt && !av_new_packet(alternate.pkt, 4));
+    alternate.pb.pub.buffer = av_malloc(16);
+    av_assert0(alternate.pb.pub.buffer);
+    alternate.pb.pub.buf_ptr = alternate.pb.pub.buffer + 3;
+    alternate.pb.pub.buf_end = alternate.pb.pub.buffer + 12;
+    alternate.pb.pub.pos = 123;
+    alternate.pb.pub.eof_reached = 1;
+    alternate.pb.pub.error = AVERROR_EOF;
+    alternate.discontinuity_pending = 1;
+    alternate.discontinuity_offset = 123;
+    audio->discard = AVDISCARD_ALL;
+    other->discard = AVDISCARD_DEFAULT;
+    av_assert0(recheck_discard_flags(s, 0) == 1);
+    av_assert0(embedded.needed && alternate.needed);
+    av_assert0(video->discard == AVDISCARD_DEFAULT && audio->discard == AVDISCARD_ALL);
+    av_assert0(alternate.cur_seq_no == 3 && alternate.seek_timestamp == c.cur_timestamp);
+    av_assert0(alternate.seek_flags == AVSEEK_FLAG_ANY && alternate.seek_stream_index == -1);
+    av_assert0(!alternate.pkt->data && !alternate.pb.pub.pos &&
+               !alternate.pb.pub.eof_reached && !alternate.pb.pub.error);
+    av_assert0(alternate.pb.pub.buf_ptr == alternate.pb.pub.buffer &&
+               alternate.pb.pub.buf_end == alternate.pb.pub.buffer);
+    av_assert0(!alternate.discontinuity_pending &&
+               alternate.discontinuity_offset == AV_NOPTS_VALUE &&
+               alternate.active_discontinuity_sequence == 4);
+    av_assert0(!recheck_discard_flags(s, 0));
+    av_packet_free(&alternate.pkt);
+    av_free(alternate.pb.pub.buffer);
+    av_free(embedded.main_streams);
+    av_free(embedded.associated_streams);
+    av_free(alternate.main_streams);
+    av_free(alternate.associated_streams);
+    avformat_free_context(embedded.ctx);
+    avformat_free_context(alternate.ctx);
+    s->priv_data = NULL;
+    avformat_free_context(s);
+}
+
+static void test_window_offsets(void)
+{
+    HLSContext c = {.first_timestamp = 1000000};
+    struct segment segment = {.duration = 2000000};
+    struct segment *segments[] = {&segment, &segment, &segment};
+    struct playlist video = {.segments = segments, .n_segments = 3,
+        .start_seq_no = 12, .window_start_offset = 4000000};
+    struct playlist audio = {.segments = segments, .n_segments = 3,
+        .start_seq_no = 91, .window_start_offset = 2000000};
+    int64_t seq, start;
+
+    av_assert0(find_timestamp_in_playlist(&c, &video, 7500000, &seq, &start));
+    av_assert0(seq == 13 && start == 7000000);
+    av_assert0(find_timestamp_in_playlist(&c, &audio, 7500000, &seq, &start));
+    av_assert0(seq == 93 && start == 7000000);
+    av_assert0(c.first_timestamp == 1000000);
+}
+
 int main(void)
 {
     struct playlist low = {0}, high = {0}, audio[140];
@@ -158,6 +245,8 @@ int main(void)
     int i;
 
     test_stream_mapping();
+    test_reactivation();
+    test_window_offsets();
     test_stream_mapping_edges();
     memset(audio, 0, sizeof(audio));
     av_strlcpy(low_var.audio_group, "audio", sizeof(low_var.audio_group));
