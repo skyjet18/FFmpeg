@@ -19,7 +19,7 @@ def run(*arguments):
     return result.stdout.decode()
 
 
-def generate(root, ffmpeg):
+def generate(root, ffmpeg, multiple=False, video_first=False, fragmented=False):
     video = root / "video.raw"
     video.write_bytes(bytes([96]) * (64 * 64 * 3 // 2 * 25))
     for track, frequency in enumerate((400, 800, 1200)):
@@ -30,13 +30,19 @@ def generate(root, ffmpeg):
         audio.write_bytes(cycle * 40)
         inputs = ("-stream_loop", "-1", "-f", "rawvideo", "-pixel_format",
                   "yuv420p", "-video_size", "64x64", "-i", str(video)) if track == 0 else ()
+        extension = "m4s" if fragmented else "ts"
+        segment_options = ("-hls_segment_type", "fmp4", "-hls_fmp4_init_filename",
+                           f"track{track}-init.mp4") if fragmented else ()
         run(ffmpeg, "-y", "-f", "s16le", "-ar", "48000", "-ac", "2",
-            "-i", str(audio), *inputs, "-map", "0:a",
-            *(("-map", "1:v", "-c:v", "mpeg2video", "-g", "25", "-bf", "0")
+            "-i", str(audio), *inputs,
+            *(("-map", "1:v") if track == 0 and video_first else ()),
+            "-map", "0:a",
+            *(("-c:v", "mpeg2video", "-g", "25", "-bf", "0")
+              + (() if video_first else ("-map", "1:v"))
               if track == 0 else ()), "-t", "40", "-c:a", "aac",
             "-b:a", "96k", "-f", "hls", "-hls_time", "2",
-            "-hls_list_size", "0", "-hls_segment_filename",
-            str(root / f"track{track}-%03d.ts"), str(root / f"track{track}.m3u8"))
+            "-hls_list_size", "0", *segment_options, "-hls_segment_filename",
+            str(root / f"track{track}-%03d.{extension}"), str(root / f"track{track}.m3u8"))
         playlist = root / f"track{track}.m3u8"
         playlist.write_text(playlist.read_text().replace(
             "#EXT-X-MEDIA-SEQUENCE:0", f"#EXT-X-MEDIA-SEQUENCE:{track * 100}"),
@@ -52,6 +58,22 @@ def generate(root, ffmpeg):
                       for i in (1, 2))
             + '#EXT-X-STREAM-INF:BANDWIDTH=500000,AUDIO="a"\n'
             f'track0{suffix}.m3u8\n', encoding="ascii")
+        if multiple:
+            master = "#EXTM3U\n"
+            for quality in range(3):
+                group = f"a{quality}"
+                for track, language in enumerate(("sk", "en", "de")):
+                    # Preserve the track prefix for the sliding-window handler.
+                    name = f"track{track}-quality{quality}{suffix}.m3u8"
+                    original = root / f"track{track}.m3u8"
+                    (root / name.replace("-live", "")).write_bytes(original.read_bytes())
+                    uri = f',URI="{name}"' if track else ""
+                    master += (f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="{group}",'
+                               f'NAME="{language}",LANGUAGE="{language}",'
+                               f'DEFAULT={"YES" if track == 0 else "NO"},AUTOSELECT=YES{uri}\n')
+                master += (f'#EXT-X-STREAM-INF:BANDWIDTH={500000 * (quality + 1)},'
+                           f'AUDIO="{group}"\ntrack0-quality{quality}{suffix}.m3u8\n')
+            (root / f"master{suffix}.m3u8").write_text(master, encoding="ascii")
 
 
 class HlsHandler(http.server.BaseHTTPRequestHandler):
@@ -60,7 +82,7 @@ class HlsHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         root = self.server.root
         path = self.path.lstrip("/")
-        match = re.fullmatch(r"track\d-(\d+)\.ts", path)
+        match = re.fullmatch(r"track\d-(\d+)\.(?:ts|m4s)", path)
         if match:
             self.server.latest_segment = max(self.server.latest_segment, int(match[1]))
         if path.endswith("-live.m3u8") and path.startswith("track"):
@@ -71,8 +93,10 @@ class HlsHandler(http.server.BaseHTTPRequestHandler):
             # of how quickly the native demuxer reads it.
             start = max(0, self.server.latest_segment - 3)
             self.server.windows.append(start)
-            data = ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:3\n"
+            version = 6 if "#EXT-X-MAP:" in original else 3
+            data = (f"#EXTM3U\n#EXT-X-VERSION:{version}\n#EXT-X-TARGETDURATION:3\n"
                     f"#EXT-X-MEDIA-SEQUENCE:{sequence + start}\n"
+                    + "".join(re.findall(r"#EXT-X-MAP:[^\n]+\n", original))
                     + "".join(segments[start:start + 5])).encode()
         else:
             file = root / path

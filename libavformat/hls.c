@@ -3047,6 +3047,8 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     for (i = 0; i < c->n_playlists; i++) {
         /* Reset reading */
         struct playlist *pls = c->playlists[i];
+        if (pls->excluded || pls->broken || !pls->n_segments)
+            continue;
         reset_playlist(pls);
 
         pls->seek_timestamp = seek_timestamp;

@@ -199,6 +199,22 @@ static void test_reactivation(void)
                alternate.discontinuity_offset == AV_NOPTS_VALUE &&
                alternate.active_discontinuity_sequence == 4);
     av_assert0(!recheck_discard_flags(s, 0));
+    {
+        struct playlist excluded = {.excluded = 1};
+        struct playlist *with_excluded[] = {&embedded, &alternate, &excluded};
+        embedded.finished = 1;
+        embedded.segments = segments;
+        embedded.n_segments = 4;
+        embedded.pkt = av_packet_alloc();
+        av_assert0(embedded.pkt);
+        c.n_playlists = 3;
+        c.playlists = with_excluded;
+        /* Quality preselection leaves excluded playlists without segments. */
+        av_assert0(!hls_read_seek(s, video->index, 675000, AVSEEK_FLAG_ANY));
+        av_assert0(embedded.seek_timestamp == 7500000 &&
+                   alternate.seek_timestamp == 7500000);
+        av_packet_free(&embedded.pkt);
+    }
     av_packet_free(&alternate.pkt);
     av_free(alternate.pb.pub.buffer);
     av_free(embedded.main_streams);
