@@ -74,7 +74,7 @@ static void test_seek(void)
     struct representation rep = {.n_timelines = 1, .timelines = times,
         .fragment_timescale = 1000, .first_seq_no = 100, .last_seq_no = 107,
         .first_pts = AV_NOPTS_VALUE};
-    DASHContext c = {.first_pts_time = AV_NOPTS_VALUE};
+    DASHContext c = {.cur_timestamp = 1113750, .first_pts_time = AV_NOPTS_VALUE};
     AVFormatContext s = {.priv_data = &c};
     struct representation *videos[] = {&rep};
     AVFormatContext *seek_context = avformat_alloc_context();
@@ -107,6 +107,9 @@ static void test_seek(void)
     rep.fragment_duration = 3840;
     av_assert0(!dash_seek(&s, &rep, 3839, 0, 1) && rep.cur_seq_no == 100);
     av_assert0(!dash_seek(&s, &rep, 3840, 0, 1) && rep.cur_seq_no == 101);
+    c.first_pts_time = 3 * AV_TIME_BASE;
+    av_assert0(!dash_seek(&s, &rep, 9500, 0, 1) && rep.cur_seq_no == 103);
+    c.first_pts_time = AV_NOPTS_VALUE;
     /* Exercise the public callback with a time-base numerator other than 1. */
     c.n_videos = 1;
     c.videos = videos;
@@ -117,15 +120,67 @@ static void test_seek(void)
     seek_context->priv_data = NULL;
     avformat_free_context(seek_context);
     rep.n_fragments = 1;
+    c.first_pts_time = 3 * AV_TIME_BASE;
     av_assert0(!dash_seek(&s, &rep, 12375, AVSEEK_FLAG_BACKWARD, 1));
-    av_assert0(rep.seek_pending && rep.seek_pos_msec == 12375 &&
-               rep.seek_flags == AVSEEK_FLAG_BACKWARD && rep.cur_timestamp == 1113750);
+    av_assert0(rep.seek_pending && rep.seek_pos_msec == 15375 &&
+               rep.seek_flags == AVSEEK_FLAG_BACKWARD && rep.cur_timestamp == 1383750);
     av_assert0(dash_seek(&s, &rep, INT64_MAX, 0, 1) == AVERROR(EINVAL));
-    av_assert0(rep.seek_pending && rep.seek_pos_msec == 12375);
+    av_assert0(rep.seek_pending && rep.seek_pos_msec == 15375);
     s.interrupt_callback.callback = test_interrupt;
     cancel_at = 1;
     av_assert0(recheck_discard_flags(&s, videos, 1) == AVERROR_EXIT);
     av_assert0(!rep.ctx && rep.seek_pending);
+    cancel_at = 0;
+}
+
+static void test_reactivate_representation_position(void)
+{
+    struct timeline timeline = {.duration = 1000, .repeat = 30};
+    struct timeline *timelines[] = {&timeline};
+    AVIOInterruptCB interrupt = {.callback = test_interrupt};
+    AVStream old_stream = {.discard = AVDISCARD_ALL};
+    AVStream selected_stream = {.discard = AVDISCARD_DEFAULT};
+    struct representation old = {
+        .cur_seq_no = 109,
+        .assoc_stream = &old_stream,
+    };
+    struct representation selected = {
+        .type = AVMEDIA_TYPE_AUDIO,
+        .n_timelines = 1,
+        .timelines = timelines,
+        .fragment_timescale = 1000,
+        .first_seq_no = 900,
+        .last_seq_no = 930,
+        .cur_seq_no = 901,
+        .assoc_stream = &selected_stream,
+    };
+    struct representation *audios[] = {&old, &selected};
+    DASHContext c = {
+        .cur_timestamp = 855000,
+        .n_audios = 2,
+        .audios = audios,
+        .first_pts_time = 3 * AV_TIME_BASE,
+    };
+    AVFormatContext s = {
+        .priv_data = &c,
+        .interrupt_callback = interrupt,
+    };
+
+    old.parent = selected.parent = &s;
+    cancel_at = 1;
+    av_assert0(recheck_discard_flags(&s, audios, 2) == AVERROR_EXIT);
+    av_assert0(selected.cur_seq_no == 912 && selected.seek_pending &&
+               selected.seek_pos_msec == 9500);
+    {
+        AVPacket packet = {.pts = 9000};
+        AVRational time_base = {1, 1000};
+
+        av_assert0(dash_drop_packet_before_seek_target(&selected, &packet, time_base));
+        av_assert0(selected.seek_pending);
+        packet.pts = 9600;
+        av_assert0(!dash_drop_packet_before_seek_target(&selected, &packet, time_base));
+        av_assert0(!selected.seek_pending);
+    }
     cancel_at = 0;
 }
 
@@ -147,6 +202,7 @@ int main(void)
     void *options = av_mallocz(sizeof(DASHContext));
 
     test_seek();
+    test_reactivate_representation_position();
     test_fragment_retry();
     av_assert0(options);
     *(const AVClass **)options = &dash_class;

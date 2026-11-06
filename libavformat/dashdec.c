@@ -2541,6 +2541,7 @@ static int dash_read_header(AVFormatContext *s)
     int i;
 
     c->interrupt_callback = &s->interrupt_callback;
+    c->cur_timestamp = AV_NOPTS_VALUE;
     c->live_start_time = AV_NOPTS_VALUE;
     c->first_pts_time = AV_NOPTS_VALUE;
 
@@ -2654,6 +2655,9 @@ static int dash_read_header(AVFormatContext *s)
     return 0;
 }
 
+static int dash_seek(AVFormatContext *s, struct representation *pls,
+                     int64_t seek_pos_msec, int flags, int dry_run);
+
 static int recheck_discard_flags(AVFormatContext *s, struct representation **p, int n)
 {
     DASHContext *c = s->priv_data;
@@ -2666,17 +2670,30 @@ static int recheck_discard_flags(AVFormatContext *s, struct representation **p, 
         if (needed && !pls->ctx) {
             pls->cur_seg_offset = 0;
             pls->init_sec_buf_read_offset = 0;
-            /* Catch up */
-            for (j = 0; j < n; j++) {
-                pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
-            }
-            if (!c->is_live && pls->n_fragments == 1) {
+            if (pls->type == AVMEDIA_TYPE_AUDIO &&
+                c->cur_timestamp != AV_NOPTS_VALUE &&
+                ((pls->fragment_timescale > 0 &&
+                  (pls->n_timelines > 0 || pls->fragment_duration > 0)) ||
+                 (!c->is_live && pls->n_fragments == 1))) {
+                /* Sequence numbers are representation-local; align by media time. */
                 int64_t position = av_rescale(c->cur_timestamp, 1000, 90000);
-                if (!pls->seek_pending || pls->seek_pos_msec < position) {
-                    pls->seek_pos_msec = position;
-                    if (!pls->seek_pending)
-                        pls->seek_flags = 0;
+                ret = dash_seek(s, pls, position, 0, 1);
+                if (ret < 0)
+                    return ret;
+                if (pls->n_fragments != 1)
                     pls->seek_pending = 1;
+            } else {
+                for (j = 0; j < n; j++)
+                    pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
+                if (!c->is_live && pls->n_fragments == 1 &&
+                    c->cur_timestamp != AV_NOPTS_VALUE) {
+                    int64_t position = av_rescale(c->cur_timestamp, 1000, 90000);
+                    if (!pls->seek_pending || pls->seek_pos_msec < position) {
+                        pls->seek_pos_msec = position;
+                        if (!pls->seek_pending)
+                            pls->seek_flags = 0;
+                        pls->seek_pending = 1;
+                    }
                 }
             }
             ret = reopen_demux_for_component(s, pls);
@@ -2689,6 +2706,29 @@ static int recheck_discard_flags(AVFormatContext *s, struct representation **p, 
             av_log(s, AV_LOG_INFO, "No longer receiving stream_index %d\n", pls->stream_index);
         }
     }
+    return 0;
+}
+
+static int dash_drop_packet_before_seek_target(struct representation *rep,
+                                               const AVPacket *pkt,
+                                               AVRational time_base)
+{
+    int64_t packet_timestamp;
+    int64_t target_timestamp;
+
+    if (!rep->seek_pending)
+        return 0;
+    if (pkt->pts == AV_NOPTS_VALUE) {
+        rep->seek_pending = 0;
+        return 0;
+    }
+
+    packet_timestamp = av_rescale_q(pkt->pts, time_base, (AVRational){1, 90000});
+    target_timestamp = av_rescale(rep->seek_pos_msec, 90, 1);
+    if (packet_timestamp < target_timestamp)
+        return 1;
+
+    rep->seek_pending = 0;
     return 0;
 }
 
@@ -2764,6 +2804,14 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
                 }
             }
 
+            if (cur->type == AVMEDIA_TYPE_AUDIO && cur->n_fragments != 1 &&
+                dash_drop_packet_before_seek_target(cur, pkt,
+                                                     cur->ctx->streams[0]->time_base)) {
+                av_packet_unref(pkt);
+                ret = 0;
+                continue;
+            }
+
             /* If we got a packet, return it */
             cur->cur_timestamp = av_rescale(pkt->pts, (int64_t)cur->ctx->streams[0]->time_base.num * 90000, cur->ctx->streams[0]->time_base.den);
             if (pkt->pts != AV_NOPTS_VALUE && cur->type != AVMEDIA_TYPE_SUBTITLE)
@@ -2809,6 +2857,10 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
     av_log(pls->parent, AV_LOG_VERBOSE, "DASH seek pos[%"PRId64"ms] %s\n",
            seek_pos_msec, dry_run ? " (dry)" : "");
 
+    if (c->first_pts_time != AV_NOPTS_VALUE)
+        seek_pos_msec = av_sat_add64(seek_pos_msec,
+            av_rescale_q(c->first_pts_time, AV_TIME_BASE_Q, (AVRational){1, 1000}));
+
     // single fragment mode
     if (pls->n_fragments == 1) {
         if (seek_pos_msec > INT64_MAX / 1000 || seek_pos_msec < INT64_MIN / 1000)
@@ -2821,14 +2873,12 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
         return dry_run ? 0 : seek_single_fragment(pls);
     }
 
+    pls->seek_pending = 0;
     ff_format_io_close(pls->parent, &pls->input);
 
     // find the nearest fragment
     if (pls->n_timelines > 0 && pls->fragment_timescale > 0) {
         int64_t num = pls->first_seq_no;
-        if (c->first_pts_time != AV_NOPTS_VALUE)
-            seek_pos_msec = av_sat_add64(seek_pos_msec,
-                av_rescale_q(c->first_pts_time, AV_TIME_BASE_Q, (AVRational){1, 1000}));
 
         if(c->is_live)
         {
@@ -2878,6 +2928,9 @@ set_seq_num:
         av_log(pls->parent, AV_LOG_ERROR, "dash_seek missing timeline or fragment_duration\n");
         pls->cur_seq_no = pls->first_seq_no;
     }
+    pls->seek_pos_msec = av_sat_sub64(seek_pos_msec,
+        c->first_pts_time == AV_NOPTS_VALUE ? 0 :
+        av_rescale_q(c->first_pts_time, AV_TIME_BASE_Q, (AVRational){1, 1000}));
     pls->cur_timestamp = 0;
     pls->cur_seg_offset = 0;
     pls->init_sec_buf_read_offset = 0;
