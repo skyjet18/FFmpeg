@@ -132,6 +132,7 @@ struct playlist {
     int64_t target_duration;
     int64_t start_seq_no;
     int64_t window_start_offset; /* Duration removed from this playlist's initial window. */
+    int64_t window_start_timestamp; /* Packet-derived media time, not the live startup point. */
     int time_offset_flag;
     int64_t start_time_offset;
     int n_segments;
@@ -369,6 +370,7 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
     }
     pls->seek_timestamp = AV_NOPTS_VALUE;
     pls->discontinuity_offset = 0;
+    pls->window_start_timestamp = AV_NOPTS_VALUE;
 
     pls->is_subtitle = 0;
 
@@ -1159,19 +1161,25 @@ static int parse_playlist(HLSContext *c, const char *url,
         }
     }
     if (prev_segments) {
-        if (pls->start_seq_no > prev_start_seq_no && c->first_timestamp != AV_NOPTS_VALUE) {
+        if (pls->start_seq_no > prev_start_seq_no) {
             int64_t prev_offset = pls->window_start_offset;
             int i;
             int64_t diff = pls->start_seq_no - prev_start_seq_no;
             for (i = 0; i < prev_n_segments && i < diff; i++) {
                 pls->window_start_offset = av_sat_add64(pls->window_start_offset,
                                                        prev_segments[i]->duration);
+                if (pls->window_start_timestamp != AV_NOPTS_VALUE)
+                    pls->window_start_timestamp = av_sat_add64(
+                        pls->window_start_timestamp, prev_segments[i]->duration);
             }
+            if (diff > prev_n_segments)
+                pls->window_start_timestamp = AV_NOPTS_VALUE;
             av_log(c->ctx, AV_LOG_DEBUG, "Media sequence change (%"PRId64" -> %"PRId64")"
                    " reflected in playlist offset: %"PRId64" -> %"PRId64"\n",
                    prev_start_seq_no, pls->start_seq_no,
                    prev_offset, pls->window_start_offset);
         } else if (pls->start_seq_no < prev_start_seq_no) {
+            pls->window_start_timestamp = AV_NOPTS_VALUE;
             av_log(c->ctx, AV_LOG_WARNING, "Media sequence changed unexpectedly: %"PRId64" -> %"PRId64"\n",
                    prev_start_seq_no, pls->start_seq_no);
         }
@@ -2047,7 +2055,18 @@ static int find_timestamp_in_playlist(HLSContext *c, struct playlist *pls,
     int64_t pos = c->first_timestamp == AV_NOPTS_VALUE ?
                   0 : c->first_timestamp;
 
-    pos = av_sat_add64(pos, pls->window_start_offset);
+    if (pls->window_start_timestamp != AV_NOPTS_VALUE) {
+        pos = pls->window_start_timestamp;
+    } else if (!pls->finished) {
+        if (!c->first_packet) {
+            *seq_no = pls->start_seq_no;
+            return 0;
+        }
+        /* EXT-X-START uses window-relative time before any packets are read. */
+        pos = 0;
+    } else {
+        pos = av_sat_add64(pos, pls->window_start_offset);
+    }
     if (timestamp < pos) {
         *seq_no = pls->start_seq_no;
         return 0;
@@ -2075,9 +2094,17 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
     int64_t seq_no;
 
     if (!pls->finished && !c->first_packet &&
-        av_gettime_relative() - pls->last_load_time >= default_reload_interval(pls))
+        av_gettime_relative() - pls->last_load_time >= default_reload_interval(pls)) {
+        int ret;
         /* reload the playlist since it was suspended */
-        parse_playlist(c, pls->url, pls, NULL);
+        ret = parse_playlist(c, pls->url, pls, NULL);
+        if (ret < 0)
+            return ret;
+    }
+    if (!pls->n_segments) {
+        av_log(c->ctx, AV_LOG_ERROR, "Cannot select a segment from an empty playlist\n");
+        return AVERROR_INVALIDDATA;
+    }
 
     /* If playback is already in progress (we are just selecting a new
      * playlist) and this is a complete file, find the matching segment
@@ -2483,6 +2510,9 @@ static int hls_read_header(AVFormatContext *s)
             continue;
 
         pls->cur_seq_no = select_cur_seq_no(c, pls);
+        if (pls->cur_seq_no < 0)
+            return pls->cur_seq_no;
+        pls->discontinuity_start_seq_no = pls->cur_seq_no;
         pls->active_discontinuity_sequence = current_segment(pls)->discontinuity_sequence;
     }
 
@@ -2722,16 +2752,24 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
         }
         if (cur_needed && !pls->needed) {
             struct segment *seg;
-
+            int64_t seq_no = select_cur_seq_no(c, pls);
+            if (seq_no < 0)
+                return seq_no;
             pls->needed = 1;
             changed = 1;
-            pls->cur_seq_no = select_cur_seq_no(c, pls);
+            pls->cur_seq_no = seq_no;
             reset_playlist(pls);
             seg = current_segment(pls);
-            if (seg)
+            if (seg) {
+                /* Resuming a rendition is not itself a timestamp discontinuity. */
+                if (seg->discontinuity_sequence != pls->active_discontinuity_sequence)
+                    pls->discontinuity_offset = AV_NOPTS_VALUE;
                 pls->active_discontinuity_sequence = seg->discontinuity_sequence;
+            }
+            av_log(s, AV_LOG_DEBUG, "Playlist %d resumed: target_us=%"PRId64
+                   " window_us=%"PRId64" correction_us=%"PRId64"\n",
+                   i, c->cur_timestamp, pls->window_start_timestamp, pls->discontinuity_offset);
             pls->discontinuity_start_seq_no = pls->cur_seq_no;
-            pls->discontinuity_offset = AV_NOPTS_VALUE;
             if (c->cur_timestamp != AV_NOPTS_VALUE) {
                 /* catch up */
                 pls->seek_timestamp = c->cur_timestamp;
@@ -2802,7 +2840,9 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
     HLSContext *c = s->priv_data;
     int ret, i, minplaylist = -1;
 
-    recheck_discard_flags(s, c->first_packet);
+    ret = recheck_discard_flags(s, c->first_packet);
+    if (ret < 0)
+        return ret;
     c->first_packet = 0;
 
     for (i = 0; i < c->n_playlists; i++) {
@@ -2851,8 +2891,17 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                         pls->pkt->dts != AV_NOPTS_VALUE) {
                         int64_t raw_timestamp = av_rescale_q(pls->pkt->dts,
                             get_timebase(pls), AV_TIME_BASE_Q);
-                        int64_t presentation_timestamp = av_sat_add64(
-                            av_sat_add64(c->first_timestamp, pls->window_start_offset),
+                        int64_t origin = pls->window_start_timestamp;
+                        int64_t presentation_timestamp;
+                        if (origin == AV_NOPTS_VALUE && pls->finished)
+                            origin = av_sat_add64(c->first_timestamp, pls->window_start_offset);
+                        if (origin == AV_NOPTS_VALUE) {
+                            av_log(s, AV_LOG_ERROR,
+                                   "Cannot anchor a live discontinuity after a missing window\n");
+                            av_packet_unref(pls->pkt);
+                            return AVERROR_INVALIDDATA;
+                        }
+                        presentation_timestamp = av_sat_add64(origin,
                             segment_start_time(pls, pls->discontinuity_start_seq_no));
 
                         pls->discontinuity_offset = av_sat_sub64(presentation_timestamp,
@@ -2873,6 +2922,14 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                         pls->pkt->dts       != AV_NOPTS_VALUE)
                         c->first_timestamp = av_rescale_q(pls->pkt->dts,
                             get_timebase(pls), AV_TIME_BASE_Q);
+                    if (!pls->finished &&
+                        pls->window_start_timestamp == AV_NOPTS_VALUE &&
+                        pls->pkt->dts != AV_NOPTS_VALUE &&
+                        pls->discontinuity_start_seq_no >= pls->start_seq_no &&
+                        pls->discontinuity_start_seq_no < pls->start_seq_no + pls->n_segments)
+                        pls->window_start_timestamp = av_sat_sub64(
+                            av_rescale_q(pls->pkt->dts, get_timebase(pls), AV_TIME_BASE_Q),
+                            segment_start_time(pls, pls->discontinuity_start_seq_no));
                 }
 
                 seg = current_segment(pls);

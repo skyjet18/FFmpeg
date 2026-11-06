@@ -148,9 +148,11 @@ static void test_reactivation(void)
     AVFormatContext *s = avformat_alloc_context();
     struct segment segment = {.duration = 2000000, .discontinuity_sequence = 4};
     struct segment *segments[] = {&segment, &segment, &segment, &segment};
-    struct playlist embedded = {.ctx = avformat_alloc_context(), .needed = 1};
+    struct playlist embedded = {.ctx = avformat_alloc_context(), .needed = 1,
+        .window_start_timestamp = AV_NOPTS_VALUE};
     struct playlist alternate = {.ctx = avformat_alloc_context(), .needed = 1,
-        .finished = 1, .segments = segments, .n_segments = 4};
+        .finished = 1, .segments = segments, .n_segments = 4,
+        .window_start_timestamp = AV_NOPTS_VALUE};
     struct playlist *playlists[] = {&embedded, &alternate};
     AVStream *video, *audio, *other;
 
@@ -199,6 +201,20 @@ static void test_reactivation(void)
                alternate.discontinuity_offset == AV_NOPTS_VALUE &&
                alternate.active_discontinuity_sequence == 4);
     av_assert0(!recheck_discard_flags(s, 0));
+    /* A live rendition keeps its established discontinuity correction on resume. */
+    alternate.needed = 0;
+    alternate.finished = 0;
+    alternate.last_load_time = av_gettime_relative();
+    alternate.window_start_timestamp = 1000000;
+    alternate.discontinuity_offset = 3000000;
+    av_assert0(recheck_discard_flags(s, 0) == 1);
+    av_assert0(alternate.cur_seq_no == 3 &&
+               alternate.discontinuity_offset == 3000000);
+    alternate.needed = 0;
+    alternate.active_discontinuity_sequence = 3;
+    av_assert0(recheck_discard_flags(s, 0) == 1);
+    av_assert0(alternate.discontinuity_offset == AV_NOPTS_VALUE &&
+               alternate.active_discontinuity_sequence == 4);
     {
         struct playlist excluded = {.excluded = 1};
         struct playlist *with_excluded[] = {&embedded, &alternate, &excluded};
@@ -229,20 +245,74 @@ static void test_reactivation(void)
 
 static void test_window_offsets(void)
 {
-    HLSContext c = {.first_timestamp = 1000000};
+    HLSContext c = {.first_timestamp = 5000000};
     struct segment segment = {.duration = 2000000};
     struct segment *segments[] = {&segment, &segment, &segment};
     struct playlist video = {.segments = segments, .n_segments = 3,
-        .start_seq_no = 12, .window_start_offset = 4000000};
+        .start_seq_no = 12, .window_start_offset = 4000000,
+        .window_start_timestamp = 5000000};
     struct playlist audio = {.segments = segments, .n_segments = 3,
-        .start_seq_no = 91, .window_start_offset = 2000000};
+        .start_seq_no = 91, .window_start_offset = 2000000,
+        .window_start_timestamp = 3000000};
     int64_t seq, start;
 
     av_assert0(find_timestamp_in_playlist(&c, &video, 7500000, &seq, &start));
     av_assert0(seq == 13 && start == 7000000);
     av_assert0(find_timestamp_in_playlist(&c, &audio, 7500000, &seq, &start));
     av_assert0(seq == 93 && start == 7000000);
-    av_assert0(c.first_timestamp == 1000000);
+    av_assert0(c.first_timestamp == 5000000);
+    video.finished = 1;
+    av_assert0(find_timestamp_in_playlist(&c, &video, 7500000, &seq, &start));
+    av_assert0(seq == 13 && start == 7000000);
+    /* A gap longer than the old window has no duration-derived origin.
+     * Resume from the earliest available segment and catch up by packet DTS. */
+    audio.window_start_timestamp = AV_NOPTS_VALUE;
+    av_assert0(!find_timestamp_in_playlist(&c, &audio, 7500000, &seq, NULL));
+    av_assert0(seq == 91);
+    audio.last_load_time = av_gettime_relative();
+    audio.time_offset_flag = 1;
+    audio.start_time_offset = -2000000;
+    c.first_packet = c.prefer_x_start = 1;
+    c.cur_timestamp = c.first_timestamp = AV_NOPTS_VALUE;
+    av_assert0(select_cur_seq_no(&c, &audio) == 93);
+}
+
+static void test_window_reload(void)
+{
+    HLSContext c = {.first_timestamp = 9000000};
+    AVFormatContext *s = avformat_alloc_context();
+    struct playlist pls = {.parent = s, .window_start_timestamp = AV_NOPTS_VALUE};
+    const char *snapshots[] = {
+        "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:100\n"
+        "#EXTINF:2,\na.ts\n#EXTINF:3,\nb.ts\n#EXTINF:4,\nc.ts\n",
+        "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:101\n"
+        "#EXTINF:3,\nb.ts\n#EXTINF:4,\nc.ts\n#EXTINF:5,\nd.ts\n",
+        "#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXT-X-MEDIA-SEQUENCE:110\n"
+        "#EXTINF:2,\ne.ts\n",
+    };
+    s->priv_data = &c;
+    c.ctx = s;
+    for (unsigned i = 0; i < FF_ARRAY_ELEMS(snapshots); i++) {
+        FFIOContext io;
+        size_t size = strlen(snapshots[i]);
+        uint8_t *buffer = av_memdup(snapshots[i], size);
+        av_assert0(buffer);
+        ffio_init_context(&io, buffer, size, 0, NULL, NULL, NULL, NULL);
+        io.pub.buf_end = buffer + size;
+        av_assert0(!parse_playlist(&c, "http://localhost/test.m3u8", &pls, &io.pub));
+        av_free(buffer);
+        if (!i)
+            pls.window_start_timestamp = 1000000;
+        else if (i == 1)
+            av_assert0(pls.window_start_timestamp == 3000000);
+        else
+            av_assert0(pls.window_start_timestamp == AV_NOPTS_VALUE);
+        av_assert0(c.first_timestamp == 9000000);
+    }
+    free_segment_dynarray(pls.segments, pls.n_segments);
+    av_free(pls.segments);
+    s->priv_data = NULL;
+    avformat_free_context(s);
 }
 
 int main(void)
@@ -263,6 +333,7 @@ int main(void)
     test_stream_mapping();
     test_reactivation();
     test_window_offsets();
+    test_window_reload();
     test_stream_mapping_edges();
     memset(audio, 0, sizeof(audio));
     av_strlcpy(low_var.audio_group, "audio", sizeof(low_var.audio_group));
