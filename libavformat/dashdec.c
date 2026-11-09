@@ -126,6 +126,9 @@ struct representation {
     uint32_t init_sec_buf_read_offset;
     int64_t cur_timestamp;
     int64_t first_pts;
+    int inactive;        /* closed because its streams are discarded or ended */
+    int drop_pending;    /* switched in: drop the packets before drop_target */
+    int64_t drop_target; /* in 90 kHz ticks, on the timeline of the returned packets */
     int is_restart_needed;
     int input_read_done; /* segment read to its end, connection still usable */
     int input_reuse;     /* demuxer restarted: send the next request on that connection */
@@ -137,6 +140,10 @@ struct representation {
 
 typedef struct DASHContext {
     const AVClass *class;
+    /* timestamp of the last returned audio/video packet or the last seek
+     * target, in 90 kHz ticks; only used to place a representation that is
+     * switched in during playback */
+    int64_t cur_timestamp;
     char *base_url;
 
     int n_videos;
@@ -2600,6 +2607,7 @@ static int dash_read_header(AVFormatContext *s)
     int i, j;
 
     c->interrupt_callback = &s->interrupt_callback;
+    c->cur_timestamp = AV_NOPTS_VALUE;
     c->live_start_time = AV_NOPTS_VALUE;
     c->first_pts_time = AV_NOPTS_VALUE;
 
@@ -2764,9 +2772,34 @@ static int dash_read_header(AVFormatContext *s)
     return 0;
 }
 
+static int dash_seek(AVFormatContext *s, struct representation *pls,
+                     int64_t seek_pos_msec, int flags, int dry_run);
+
+/* The packets of a representation that was switched in are dropped up to
+ * the playing position, but not if they are further away from it than this:
+ * the representation was not placed there then (timestamps that do not
+ * follow the manifest) and is read as it comes, as before. */
+#define SWITCH_IN_DROP_MAX (30 * 90000)
+
+/* Can a representation that is switched in during playback be placed at
+ * the playing position by media time? The segment numbers of another
+ * representation do not say where it is: every representation has its own
+ * numbering, and a discarded one keeps its old number. */
+static int switch_in_by_time(DASHContext *c, struct representation *pls)
+{
+    if (!pls->inactive || pls->type != AVMEDIA_TYPE_AUDIO ||
+        c->cur_timestamp == AV_NOPTS_VALUE)
+        return 0;
+    if (pls->n_fragments == 1)
+        return !c->is_live;
+    return pls->fragment_timescale > 0 &&
+           (pls->n_timelines > 0 || pls->fragment_duration > 0);
+}
+
 static void recheck_discard_flags(AVFormatContext *s, struct representation **p, int n)
 {
-    int i, j;
+    DASHContext *c = s->priv_data;
+    int i, j, ret;
 
     for (i = 0; i < n; i++) {
         struct representation *pls = p[i];
@@ -2776,20 +2809,94 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
             needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
 
         if (needed && !pls->ctx) {
+            int by_time = switch_in_by_time(c, pls);
+            int64_t position = 0;
+
             pls->cur_seg_offset = 0;
             pls->init_sec_buf_read_offset = 0;
-            /* Catch up */
-            for (j = 0; j < n; j++) {
-                pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
+            pls->drop_pending = 0;
+            if (by_time) {
+                /* in ms, on the timeline of the returned packets */
+                position = av_rescale(c->cur_timestamp, 1000, 90000);
             }
-            reopen_demux_for_component(s, pls);
+            if (by_time && pls->n_fragments != 1) {
+                if (pls->n_timelines) {
+                    /* the segment of the SegmentTimeline, as for a seek */
+                    dash_seek(s, pls, position, 0, 1);
+                } else {
+                    /* Segments of a fixed duration are counted from the
+                     * presentation time offset; the returned packets were
+                     * shifted by first_pts_time. */
+                    int64_t pos = position;
+
+                    if (c->first_pts_time != AV_NOPTS_VALUE)
+                        pos = av_sat_add64(pos, c->first_pts_time / 1000);
+                    pos = av_sat_sub64(pos, av_rescale(pls->presentation_timeoffset,
+                                                       1000, pls->fragment_timescale));
+                    pls->cur_seq_no = pls->first_seq_no +
+                                      av_rescale_rnd(FFMAX(pos, 0), pls->fragment_timescale,
+                                                     pls->fragment_duration * 1000,
+                                                     AV_ROUND_DOWN);
+                    if (!c->is_live)
+                        pls->cur_seq_no = FFMIN(pls->cur_seq_no,
+                                                FFMAX(pls->last_seq_no, pls->first_seq_no));
+                    pls->cur_timestamp = 0;
+                }
+                pls->drop_pending = 1;
+                pls->drop_target  = c->cur_timestamp;
+            } else if (!by_time) {
+                /* Catch up */
+                for (j = 0; j < n; j++) {
+                    pls->cur_seq_no = FFMAX(pls->cur_seq_no, p[j]->cur_seq_no);
+                }
+            }
+            ret = reopen_demux_for_component(s, pls);
+            if (ret >= 0)
+                pls->inactive = 0;
+            if (ret >= 0 && by_time && pls->n_fragments == 1) {
+                /* single file: it was opened at its start, seek to the
+                 * playing position (its packets are not shifted) */
+                ret = AVERROR(EINVAL);
+                if (position <= INT64_MAX / 1000 && position >= INT64_MIN / 1000) {
+                    ff_read_frame_flush(pls->ctx);
+                    ret = av_seek_frame(pls->ctx, -1, position * 1000, AVSEEK_FLAG_BACKWARD);
+                }
+                if (ret >= 0) {
+                    pls->drop_pending = 1;
+                    pls->drop_target  = c->cur_timestamp;
+                } else {
+                    av_log(s, AV_LOG_WARNING, "stream_index %d could not be placed at "
+                           "%"PRId64" ms, it starts where it is: %s\n",
+                           pls->stream_index, position, av_err2str(ret));
+                }
+            }
             av_log(s, AV_LOG_INFO, "Now receiving stream_index %d\n", pls->stream_index);
         } else if (!needed && pls->ctx) {
             close_demux_for_component(pls);
             ff_format_io_close(pls->parent, &pls->input);
+            pls->inactive = 1;
             av_log(s, AV_LOG_INFO, "No longer receiving stream_index %d\n", pls->stream_index);
         }
     }
+}
+
+/* Does pkt (shifted already) lie before the position a representation was
+ * switched in at? Ends with the first packet that does not, that has no
+ * pts, or that shows that the representation was not placed there. */
+static int switch_in_drop(struct representation *pls, const AVPacket *pkt)
+{
+    AVRational tb = pls->ctx->streams[0]->time_base;
+    int64_t ts;
+
+    if (!pls->drop_pending)
+        return 0;
+    if (pkt->pts != AV_NOPTS_VALUE) {
+        ts = av_rescale_q(pkt->pts, tb, (AVRational){1, 90000});
+        if (ts < pls->drop_target && pls->drop_target - ts <= SWITCH_IN_DROP_MAX)
+            return 1;
+    }
+    pls->drop_pending = 0;
+    return 0;
 }
 
 static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
@@ -2863,8 +2970,17 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
                 }
             }
 
+            if (switch_in_drop(cur, pkt)) {
+                av_packet_unref(pkt);
+                if (ff_check_interrupt(c->interrupt_callback))
+                    return AVERROR_EXIT;
+                continue;
+            }
+
             /* If we got a packet, return it */
             cur->cur_timestamp = av_rescale(pkt->pts, (int64_t)cur->ctx->streams[0]->time_base.num * 90000, cur->ctx->streams[0]->time_base.den);
+            if (pkt->pts != AV_NOPTS_VALUE && cur->type != AVMEDIA_TYPE_SUBTITLE)
+                c->cur_timestamp = cur->cur_timestamp;
             pkt->stream_index += cur->stream_index;
             return 0;
         }
@@ -2880,6 +2996,7 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
         } else if (ret == AVERROR_EOF) {
             close_demux_for_component(cur);
             ff_format_io_close(cur->parent, &cur->input);
+            cur->inactive = 1;
             av_log(s, AV_LOG_DEBUG, "EOF on stream_index %d\n", cur->stream_index);
             // prevent recheck_discard_flags() from re-enabling the component
             for (int i = 0; i < cur->nb_assoc_stream; i++)
@@ -2911,6 +3028,7 @@ static int dash_seek(AVFormatContext *s, struct representation *pls, int64_t see
     int j = 0;
     int64_t duration = 0;
 
+    pls->drop_pending = 0;
     av_log(pls->parent, AV_LOG_VERBOSE, "DASH seek pos[%"PRId64"ms] %s\n",
            seek_pos_msec, dry_run ? " (dry)" : "");
 
@@ -3013,6 +3131,8 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
         if (!ret)
             ret = dash_seek(s, c->subtitles[i], seek_pos_msec, flags, !c->subtitles[i]->ctx);
     }
+    if (!ret)
+        c->cur_timestamp = av_rescale(seek_pos_msec, 90, 1);
 
     return ret;
 }
