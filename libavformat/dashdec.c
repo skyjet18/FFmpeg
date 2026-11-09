@@ -216,6 +216,19 @@ static int ishttp(char *url)
     return proto_name && av_strstart(proto_name, "http", NULL);
 }
 
+/* 1 if open_url() reaches the url through http(s), also below crypto */
+static int segment_is_http(const char *url)
+{
+    const char *proto_name = NULL;
+
+    if (av_strstart(url, "crypto", NULL) && (url[6] == '+' || url[6] == ':'))
+        proto_name = avio_find_protocol_name(url + 7);
+    if (!proto_name)
+        proto_name = avio_find_protocol_name(url);
+
+    return proto_name && av_strstart(proto_name, "http", NULL);
+}
+
 static int aligned(int val)
 {
     return ((val + 0x3F) >> 6) << 6;
@@ -2171,6 +2184,7 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
     AVDictionary *opts = NULL;
     char *url = NULL;
     int ret = 0;
+    int is_http;
 
     url = av_mallocz(c->max_url_size);
     if (!url) {
@@ -2185,7 +2199,18 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
         av_dict_set_int(&opts, "end_offset", seg->url_offset + seg->size, 0);
     }
 
-    if( pls->type == AVMEDIA_TYPE_SUBTITLE )
+    ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
+
+    is_http = segment_is_http(url);
+    if (!is_http)
+    {
+        /* the options below are http options. The file protocol has
+         * a seekable option of its own, which only takes -1 and 0: with
+         * seekable=1 a local file could not be opened at all. A local file
+         * is opened with the defaults, as in FFmpeg without these patches;
+         * the start of a byte range is looked up after opening. */
+    }
+    else if( pls->type == AVMEDIA_TYPE_SUBTITLE )
     {
         /* disable seeking for subtitles - subtitles are small and many servers doesn't support byterange for subtitles */
         av_dict_set(&opts, "seekable", "0", 0);
@@ -2205,10 +2230,21 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
         av_dict_set(&opts, "multiple_requests", "1", 0);
     }
 
-    ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
     av_log(pls->parent, AV_LOG_VERBOSE, "DASH request for url '%s', offset %"PRId64"\n",
            url, seg->url_offset);
     ret = open_url(pls->parent, &pls->input, url, &c->avio_opts, opts, NULL);
+
+    if (ret >= 0 && !is_http && seg->size >= 0 && seg->url_offset > 0) {
+        /* A byte range segment: http starts at the range with the offset
+         * option, the file protocol does not know it and starts at the
+         * beginning of the file. read_from_url() ends the segment after
+         * seg->size bytes. */
+        int64_t pos = avio_seek(pls->input, seg->url_offset, SEEK_SET);
+        if (pos < 0) {
+            ff_format_io_close(pls->parent, &pls->input);
+            ret = pos;
+        }
+    }
 
 cleanup:
     av_free(url);
@@ -2336,6 +2372,13 @@ restart:
     ret = read_from_url(v, v->cur_seg, buf, buf_size);
     if (ret > 0)
         goto end;
+
+    /* A byte range segment read to its end gives a read of 0 bytes, which
+     * returns 0. For the caller 0 is not an end: a demuxer that skips to
+     * a position behind the data of the segment (a range that is shorter
+     * than the media in it) asked for more forever. */
+    if (!ret)
+        ret = AVERROR_EOF;
 
     if (c->is_live || v->cur_seq_no < v->last_seq_no) {
         if (!v->is_restart_needed)
