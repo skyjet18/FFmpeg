@@ -49,14 +49,33 @@ additional stream specifier (see below), then it selects stream number
 order of the streams as detected by libavformat except when a stream group
 specifier or program ID is also specified. In this case it is based on the
 ordering of the streams in the group or program.
-@item @var{stream_type}[:@var{additional_stream_specifier}]
+@item @var{stream_type}[:@var{codec_name}][:@var{additional_stream_specifier}]
 @var{stream_type} is one of following: 'v' or 'V' for video, 'a' for audio, 's'
 for subtitle, 'd' for data, and 't' for attachments. 'v' matches all video
 streams, 'V' only matches video streams which are not attached pictures, video
-thumbnails or cover arts. If @var{additional_stream_specifier} is used, then
-it matches streams which both have this type and match the
+thumbnails or cover arts.
+
+@var{codec_name} is only available in @command{ffmpeg}, not in
+@command{ffprobe} and @command{ffplay}. If it is present, it must be the
+canonical name of a codec of this type (as printed by the @option{-codecs}
+option), such as @code{aac} or @code{h264}, and matches streams which have
+both the specified type and codec. For output streams mapped from an input
+stream the codec name refers to the input codec, also when the stream is
+reencoded. Output streams fed by a complex filtergraph have no input codec and
+are never matched by a codec name.
+
+If @var{additional_stream_specifier} is used, then it matches streams which
+have this type and codec, when specified, and also match the
 @var{additional_stream_specifier}. Otherwise, it matches all streams of the
-specified type.
+specified type and codec. For example, @code{a:aac} matches all AAC audio
+streams and @code{a:aac:1} matches the second AAC audio stream.
+
+In @command{ffmpeg}, a token following @var{stream_type} is only taken as
+@var{codec_name} when it is the name of a codec of that type; anything else is
+interpreted as an @var{additional_stream_specifier}, so that forms such as
+@code{a:1} or @code{a:m:language:eng} keep their meaning. Codec names starting
+with a digit (e.g. @code{4xm}) cannot be used, as a digit always starts a
+stream index.
 @item g:@var{group_specifier}[:@var{additional_stream_specifier}]
 Matches streams which are in the group with the specifier @var{group_specifier}.
 if @var{additional_stream_specifier} is used, then it matches streams which both

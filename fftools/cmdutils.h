@@ -128,6 +128,10 @@ typedef struct StreamSpecifier {
     enum AVMediaType     media_type;
     uint8_t              no_apic;
 
+    // when not AV_CODEC_ID_NONE, consider only streams with this codec;
+    // only ever set together with media_type
+    enum AVCodecID       codec_id;
+
     uint8_t              usable_only;
 
     int                  disposition;

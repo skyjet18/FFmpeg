@@ -999,6 +999,54 @@ int cmdutils_isalnum(char c)
            (c >= 'a' && c <= 'z');
 }
 
+/**
+ * Check whether the stream type in a stream specifier is followed by a codec
+ * name, as in a:aac or v:h264:1.
+ *
+ * @param spec points right after the stream type letter
+ * @param type media type selected by the stream type letter
+ * @param codec_id set to the codec id when a codec name is found
+ *
+ * @return length of the ":codec_name" part, 0 when the next token is not the
+ *         name of a codec of the given type and is thus left to be parsed
+ *         as an additional stream specifier
+ */
+static size_t stream_specifier_codec(const char *spec, enum AVMediaType type,
+                                     enum AVCodecID *codec_id)
+{
+    const AVCodecDescriptor *desc;
+    char name[64];
+    size_t len;
+
+    if (*spec != ':')
+        return 0;
+    spec++;
+
+    for (len = 0; cmdutils_isalnum(spec[len]) ||
+                  spec[len] == '_' || spec[len] == '.'; len++)
+        continue;
+
+    /* Everything that already has a meaning in a stream specifier keeps it:
+     * - a leading digit starts a stream index
+     * - single letters are stream types or the p, g, i, m, u designators
+     * - disp: starts a disposition specifier */
+    if (len < 2 || len >= sizeof(name)   ||
+        (*spec >= '0' && *spec <= '9')   ||
+        (len == 4 && !strncmp(spec, "disp", 4)))
+        return 0;
+
+    memcpy(name, spec, len);
+    name[len] = 0;
+
+    desc = avcodec_descriptor_get_by_name(name);
+    if (!desc || desc->type != type)
+        return 0;
+
+    *codec_id = desc->id;
+
+    return len + 1;
+}
+
 void stream_specifier_uninit(StreamSpecifier *ss)
 {
     av_freep(&ss->meta_key);
@@ -1056,6 +1104,12 @@ int stream_specifier_parse(StreamSpecifier *ss, const char *spec,
 
             av_log(logctx, AV_LOG_TRACE, "Parsed media type: %s; remainder: %s\n",
                    av_get_media_type_string(ss->media_type), spec);
+
+            /* opt:[vasdtV]:codec_name */
+            spec += stream_specifier_codec(spec, ss->media_type, &ss->codec_id);
+            if (ss->codec_id != AV_CODEC_ID_NONE)
+                av_log(logctx, AV_LOG_TRACE, "Parsed codec: %s; remainder: %s\n",
+                       avcodec_get_name(ss->codec_id), spec);
         } else if (*spec == 'g' && *(spec + 1) == ':') {
             if (ss->stream_list != STREAM_LIST_ALL)
                 goto multiple_stream_lists;
@@ -1292,6 +1346,10 @@ unsigned stream_specifier_match(const StreamSpecifier *ss,
         if (ss->media_type != AVMEDIA_TYPE_UNKNOWN &&
             (ss->media_type != candidate->codecpar->codec_type ||
              (ss->no_apic && (candidate->disposition & AV_DISPOSITION_ATTACHED_PIC))))
+            continue;
+
+        if (ss->codec_id != AV_CODEC_ID_NONE &&
+            ss->codec_id != candidate->codecpar->codec_id)
             continue;
 
         if (ss->meta_key) {
