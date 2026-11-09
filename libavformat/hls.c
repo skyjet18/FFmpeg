@@ -3012,6 +3012,36 @@ static int hls_read_header(AVFormatContext *s)
     return 0;
 }
 
+/* Restart the reading of a playlist (seek, playlist switched in again):
+ * drop the segment connections and everything buffered from the old
+ * position, in the I/O context, the packet and the segment demuxer. */
+static void reset_playlist(struct playlist *pls)
+{
+    AVIOContext *const pb = &pls->pb.pub;
+
+    ff_format_io_close(pls->parent, &pls->input);
+    pls->input_read_done = 0;
+    ff_format_io_close(pls->parent, &pls->input_next);
+    pls->input_next_requested = 0;
+    av_packet_unref(pls->pkt);
+    pb->eof_reached = 0;
+    /* Clear any buffered data */
+    pb->buf_end = pb->buf_ptr = pb->buffer;
+    /* Reset the pos, to let the mpegts/mov demuxer know we've seeked. */
+    pb->pos = 0;
+    /* Flush the packet queue of the subdemuxer. */
+    if (pls->ctx) {
+        ff_read_frame_flush(pls->ctx);
+        for (unsigned j = 0; j < pls->ctx->nb_streams; j++)
+            ffstream(pls->ctx->streams[j])->pts_wrap_reference = AV_NOPTS_VALUE;
+    }
+    if (pls->is_subtitle)
+        avformat_close_input(&pls->ctx);
+
+    /* Reset the init segment so it's re-fetched and served appropriately */
+    pls->cur_init_section = NULL;
+}
+
 static int recheck_discard_flags(AVFormatContext *s, int first)
 {
     HLSContext *c = s->priv_data;
@@ -3030,6 +3060,15 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
         if (cur_needed && !pls->needed) {
             pls->needed = 1;
             changed = 1;
+            /* A playlist switched in during playback may have been read
+             * before (for the stream info, or until its streams were
+             * discarded): what is left of that, a buffered packet, the
+             * rest of a segment, packets queued in the segment demuxer,
+             * belongs to another position. Restart it like a seek does.
+             * (Before the first packet only playlists that were not read
+             * yet are switched in.) */
+            if (!first)
+                reset_playlist(pls);
             pls->cur_seq_no = select_cur_seq_no(c, pls);
             discontinuity_select(c, pls, 1);
             pls->pb.pub.eof_reached = 0;
@@ -3126,10 +3165,8 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
     HLSContext *c = s->priv_data;
     int ret, i, minplaylist = -1;
 
-    if (c->first_packet) {
-        recheck_discard_flags(s, 1);
-        c->first_packet = 0;
-    }
+    recheck_discard_flags(s, c->first_packet);
+    c->first_packet = 0;
 
     for (i = 0; i < c->n_playlists; i++) {
         struct playlist *pls = c->playlists[i];
@@ -3465,28 +3502,8 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     for (i = 0; i < c->n_playlists; i++) {
         /* Reset reading */
         struct playlist *pls = c->playlists[i];
-        AVIOContext *const pb = &pls->pb.pub;
-        ff_format_io_close(pls->parent, &pls->input);
-        pls->input_read_done = 0;
-        ff_format_io_close(pls->parent, &pls->input_next);
-        pls->input_next_requested = 0;
-        av_packet_unref(pls->pkt);
-        pb->eof_reached = 0;
-        /* Clear any buffered data */
-        pb->buf_end = pb->buf_ptr = pb->buffer;
-        /* Reset the pos, to let the mpegts/mov demuxer know we've seeked. */
-        pb->pos = 0;
-        /* Flush the packet queue of the subdemuxer. */
-        if (pls->ctx) {
-            ff_read_frame_flush(pls->ctx);
-            for (j = 0; j < (int)pls->ctx->nb_streams; j++)
-                ffstream(pls->ctx->streams[j])->pts_wrap_reference = AV_NOPTS_VALUE;
-        }
-        if (pls->is_subtitle)
-            avformat_close_input(&pls->ctx);
 
-        /* Reset the init segment so it's re-fetched and served appropriately */
-        pls->cur_init_section = NULL;
+        reset_playlist(pls);
 
         /* The discard in hls_read_packet compares this playlist's packet DTS
          * against seek_timestamp, but seek_timestamp is on c->first_timestamp's
