@@ -292,6 +292,58 @@ FATE_FFMPEG-$(call ENCDEC2, MPEG2VIDEO, FFV1, NUT, HSTACK_FILTER PIPE_PROTOCOL F
 fate-ffmpeg-spec-disposition: CMD = framecrc -i $(TARGET_SAMPLES)/mpegts/pmtchange.ts -map '0:disp:visual_impaired+descriptions:1' -c copy
 FATE_SAMPLES_FFMPEG-$(call FRAMECRC, MPEGTS,,) += fate-ffmpeg-spec-disposition
 
+# test matching by codec name
+# audio streams of the test file: 0 pcm_s16le, 1 pcm_alaw, 2 pcm_s16le
+tests/data/spec-codec.nut: TAG = GEN
+tests/data/spec-codec.nut: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin \
+        -f lavfi -i "sine=1000:d=0.1" -f lavfi -i "sine=2000:d=0.1" -f lavfi -i "sine=3000:d=0.1" \
+        -map 0 -map 1 -map 2 -c:a pcm_s16le -c:a:1 pcm_alaw -bitexact \
+        -y $(TARGET_PATH)/tests/data/spec-codec.nut 2>/dev/null
+
+SPEC_CODEC_FILE   = $(TARGET_PATH)/tests/data/spec-codec.nut
+SPEC_CODEC_FFMPEG = $(FFMPEG) -nostdin -hide_banner -loglevel error -i $(SPEC_CODEC_FILE)
+SPEC_CODEC_PROBE  = ffprobe$(PROGSSUF)$(EXESUF) -bitexact -show_entries stream=index,codec_name -of compact=p=0:nk=1
+SPEC_CODEC_DEPS   = LAVFI_INDEV SINE_FILTER PCM_S16LE_DECODER PCM_S16LE_ENCODER \
+                    PCM_ALAW_DECODER PCM_ALAW_ENCODER PCM_MULAW_ENCODER         \
+                    NUT_MUXER NUT_DEMUXER FILE_PROTOCOL
+
+# only the pcm_alaw stream is reencoded
+fate-ffmpeg-spec-codec: CMD = run_with_temp \
+    "$(SPEC_CODEC_FFMPEG) -map 0 -c copy -c:a:pcm_alaw pcm_mulaw -bitexact -f nut -y" \
+    "$(SPEC_CODEC_PROBE)" nut
+# the index counts the streams with the given codec
+fate-ffmpeg-spec-codec-index: CMD = run_with_temp \
+    "$(SPEC_CODEC_FFMPEG) -map 0 -c copy -c:a:pcm_s16le:1 pcm_mulaw -bitexact -f nut -y" \
+    "$(SPEC_CODEC_PROBE)" nut
+# an index directly after the stream type still counts all streams of the type
+fate-ffmpeg-spec-codec-compat: CMD = run_with_temp \
+    "$(SPEC_CODEC_FFMPEG) -map 0 -c copy -c:a:1 pcm_mulaw -bitexact -f nut -y" \
+    "$(SPEC_CODEC_PROBE)" nut
+# input streams are selected by codec in -map
+fate-ffmpeg-spec-codec-map: CMD = run_with_temp \
+    "$(SPEC_CODEC_FFMPEG) -map 0:a:pcm_s16le -c copy -bitexact -f nut -y" \
+    "$(SPEC_CODEC_PROBE)" nut
+# filtergraph inputs are selected by codec, an output stream fed by
+# a filtergraph has no input codec and is not matched by a codec name
+fate-ffmpeg-spec-codec-filter: CMD = run_with_temp \
+    "$(SPEC_CODEC_FFMPEG) -filter_complex [0:a:pcm_alaw]anull[f] -map [f] -map 0:a:pcm_s16le:1 -c:a pcm_s16le -c:a:pcm_s16le pcm_mulaw -bitexact -f nut -y" \
+    "$(SPEC_CODEC_PROBE)" nut
+# a codec of another type is not a codec name in the specifier, as before
+# the specifier is then invalid
+fate-ffmpeg-spec-codec-type: CMD = ffmpeg -i $(SPEC_CODEC_FILE) -map 0 -c copy -c:a:h264 pcm_mulaw -f null -; test $$? -ne 0
+fate-ffmpeg-spec-codec-type: CMP = null
+
+FATE_SPEC_CODEC-$(call ALLYES, $(SPEC_CODEC_DEPS))              += fate-ffmpeg-spec-codec        \
+                                                                   fate-ffmpeg-spec-codec-index  \
+                                                                   fate-ffmpeg-spec-codec-compat \
+                                                                   fate-ffmpeg-spec-codec-map
+FATE_SPEC_CODEC-$(call ALLYES, $(SPEC_CODEC_DEPS) ANULL_FILTER) += fate-ffmpeg-spec-codec-filter
+FATE_SPEC_CODEC-$(call ALLYES, $(SPEC_CODEC_DEPS) NULL_MUXER)   += fate-ffmpeg-spec-codec-type
+$(FATE_SPEC_CODEC-yes): tests/data/spec-codec.nut
+FATE_FFMPEG_FFPROBE += $(FATE_SPEC_CODEC-yes)
+fate-ffmpeg-spec-codec-all: $(FATE_SPEC_CODEC-yes)
+
 # test heif image merging using internally defined filtegraphs
 # picking the stream group if not mapping any specific stream
 fate-ffmpeg-heif-merge: CMD = framecrc -i $(TARGET_SAMPLES)/heif-conformance/C007.heic

@@ -1202,6 +1202,13 @@ static int ost_add(Muxer *mux, const OptionsContext *o, enum AVMediaType type,
     ost->kf.ref_pts = AV_NOPTS_VALUE;
     ms->par_in->codec_type   = type;
     st->codecpar->codec_type = type;
+    /* Lets stream specifiers with a codec name (-c:a:aac ...) match mapped
+     * streams by their input codec while the output options are evaluated.
+     * This is not an output parameter: of_stream_init() replaces the whole
+     * codecpar with the streamcopy/encoder/bsf parameters before the header
+     * is written. */
+    if (ist)
+        st->codecpar->codec_id = ist->par->codec_id;
 
     if (ost->type == AVMEDIA_TYPE_VIDEO) {
         if (ost->ist)
