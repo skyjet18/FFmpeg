@@ -1905,7 +1905,10 @@ static int64_t calc_max_seg_no(struct representation *pls, DASHContext *c)
             }
         }
     } else if (c->is_live && pls->fragment_duration) {
-        num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time)) * pls->fragment_timescale)  / pls->fragment_duration;
+        /* The newest segment that is complete. The segment the clock is in
+         * is still being produced: it is there when its duration has
+         * passed, a request before that is answered with 404. */
+        num = pls->first_seq_no + (((get_current_time_in_sec() - c->availability_start_time)) * pls->fragment_timescale)  / pls->fragment_duration - 1;
     } else if (pls->fragment_duration) {
         num = pls->first_seq_no + av_rescale_rnd(1, c->media_presentation_duration * pls->fragment_timescale, pls->fragment_duration, AV_ROUND_UP);
     }

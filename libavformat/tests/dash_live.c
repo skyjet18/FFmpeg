@@ -180,6 +180,9 @@ static void test_duration_live_start(void)
     c.live_delay = c.suggested_presentation_delay = 0;
     c.availability_start_time = get_current_time_in_sec() - 120;
     av_assert0(calc_cur_seg_no(&s, &fixed) == 127);
+    /* 120 s are 31 segments and a quarter: the 32nd (number 131) is being
+     * produced, the newest one to ask for is number 130 */
+    av_assert0(calc_max_seg_no(&fixed, &c) == 130);
     /* suggestedPresentationDelay gives the segment it gave before */
     c.suggested_presentation_delay = 24;
     av_assert0(calc_cur_seg_no(&s, &fixed) == 125);
