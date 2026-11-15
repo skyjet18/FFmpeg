@@ -2492,6 +2492,24 @@ static int shares_numbering(HLSContext *c, struct playlist *pls)
     return !compared;
 }
 
+/* The segment of pls that timestamp falls into, counted from the timeline
+ * anchor of the playlist (which must be set), or -1 if the timestamp is not
+ * in the window: the anchor and the timestamp do not belong together then
+ * (a playing position outside the live window, timestamps that wrapped). */
+static int64_t seq_no_by_anchor(HLSContext *c, struct playlist *pls, int64_t timestamp)
+{
+    int64_t pos = segment_start_time(c, pls, pls->start_seq_no);
+
+    if (timestamp < pos)
+        return -1;
+    for (int i = 0; i < pls->n_segments; i++) {
+        pos = av_sat_add64(pos, pls->segments[i]->duration);
+        if (timestamp < pos)
+            return pls->start_seq_no + i;
+    }
+    return -1;
+}
+
 static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
 {
     int64_t seq_no;
@@ -2524,6 +2542,24 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
                  (pls->timeline_time != AV_NOPTS_VALUE && !shares_numbering(c, pls)))) {
                 find_timestamp_in_playlist(c, pls, c->cur_timestamp, &seq_no, NULL);
                 return seq_no;
+            }
+            /* Without discontinuities the media sequence number of the
+             * playlists being read is taken as before. Only if this
+             * playlist has a timeline anchor (it was read not longer ago
+             * than its window is long, the anchor has followed the
+             * reloads) and that anchor puts the playing position into the
+             * window, more than one segment away from that number or with
+             * the number not in the window at all, the renditions are
+             * numbered independently: the segment is taken by time then.
+             * Without an anchor, or with a playing position that is not
+             * in the window by it, the rules below stay. */
+            if (!pls->has_discontinuity && pls->n_segments > 0 &&
+                c->cur_timestamp != AV_NOPTS_VALUE &&
+                pls->timeline_time != AV_NOPTS_VALUE) {
+                int64_t by_time = seq_no_by_anchor(c, pls, c->cur_timestamp);
+                if (by_time >= 0 &&
+                    (!in_window || FFABS(by_time - c->cur_seq_no) > 1))
+                    return by_time;
             }
             if (in_window)
                 /* While spec 3.4.3 says that we cannot assume anything about the
@@ -3221,6 +3257,8 @@ static void reset_playlist(struct playlist *pls)
     pls->input_next_requested = 0;
     av_packet_unref(pls->pkt);
     pb->eof_reached = 0;
+    /* an error of the old position is not the one of the new position */
+    pb->error = 0;
     /* Clear any buffered data */
     pb->buf_end = pb->buf_ptr = pb->buffer;
     /* Reset the pos, to let the mpegts/mov demuxer know we've seeked. */

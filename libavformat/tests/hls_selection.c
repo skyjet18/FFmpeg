@@ -278,8 +278,62 @@ static void test_event_start(void)
     av_assert0(select_cur_seq_no(&c, &pls) == 31);
 }
 
+/* A live rendition without discontinuities that is switched in again: by
+ * the media sequence number of the playlists being read, as before, unless
+ * its timeline anchor says that this number is another position. */
+static void test_live_switch_in(void)
+{
+    struct segment seg = {.duration = 2000000};
+    struct segment *segments[] = {&seg, &seg, &seg, &seg, &seg};
+    struct playlist pls = {.start_seq_no = 110, .n_segments = 5, .segments = segments,
+                           .timeline_seq_no = 110, .timeline_time = 20000000};
+    HLSContext c = {.live_start_index = -3, .first_timestamp = 1000000};
+
+    /* the playlists being read count from another number: by time */
+    pls.last_load_time = av_gettime_relative();
+    c.cur_seq_no = 12;
+    c.cur_timestamp = 27500000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 113);
+    c.cur_timestamp = 20000000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 110);
+    c.cur_timestamp = 29999999;
+    av_assert0(select_cur_seq_no(&c, &pls) == 114);
+    /* a playing position that is not in the window by the anchor: the
+     * anchor is not used, live_start_index as before */
+    c.cur_timestamp = 19000000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 112);
+    c.cur_timestamp = 30000000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 112);
+    /* an anchor that is not on the first segment of the window */
+    pls.timeline_seq_no = 112;
+    pls.timeline_time   = 24000000;
+    c.cur_timestamp = 27500000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 113);
+    c.cur_timestamp = 21000000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 110);
+    /* the same numbering: the number is taken, also one segment off */
+    c.cur_seq_no = 112;
+    c.cur_timestamp = 25000000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 112);
+    c.cur_timestamp = 26100000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 112);
+    c.cur_timestamp = 23900000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 112);
+    /* a number that is in the window by chance, but two segments away */
+    c.cur_seq_no = 110;
+    c.cur_timestamp = 27500000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 113);
+    /* no anchor (the window has passed since the playlist was read): the
+     * number if it is in the window, else live_start_index, as before */
+    pls.timeline_time = AV_NOPTS_VALUE;
+    av_assert0(select_cur_seq_no(&c, &pls) == 110);
+    c.cur_seq_no = 12;
+    av_assert0(select_cur_seq_no(&c, &pls) == 112);
+}
+
 int main(void)
 {
+    test_live_switch_in();
     test_stream_mapping();
     test_stream_mapping_edges();
     test_preselection();
