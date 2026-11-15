@@ -1608,8 +1608,9 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
             ret = AVERROR_INVALIDDATA;
             goto cleanup;
         }
-        if (!av_strcasecmp(val, "dynamic"))
-            c->is_live = 1;
+        /* also on a reload: a live presentation that has ended is
+         * published as static, and is read to its end from then on */
+        c->is_live = !av_strcasecmp(val, "dynamic");
         xmlFree(val);
 
         attr = node->properties;
@@ -1985,6 +1986,7 @@ static int refresh_manifest(AVFormatContext *s)
     int n_subtitles = c->n_subtitles;
     struct representation **subtitles = c->subtitles;
     char *base_url = c->base_url;
+    int was_live = c->is_live;
 
     uint64_t cur_time = get_current_time_in_sec();
 //    uint64_t publish_time = c->publish_time > 0 ? c->publish_time : c->playlist_load_time;
@@ -2072,7 +2074,23 @@ static int refresh_manifest(AVFormatContext *s)
         }
     }
 
+    if (was_live && !c->is_live) {
+        /* The presentation has ended. The last segment of a SegmentTemplate
+         * with a duration was taken from the clock while it was live; it is
+         * the end of mediaPresentationDuration now. SegmentTimeline and
+         * SegmentList took theirs from the new manifest above. */
+        struct representation **lists[] = { videos, audios, subtitles };
+        int counts[] = { n_videos, n_audios, n_subtitles };
+        av_log(s, AV_LOG_VERBOSE, "The live presentation has ended, the manifest is static\n");
+        for (int l = 0; l < 3; l++)
+            for (i = 0; i < counts[l]; i++)
+                if (!lists[l][i]->n_timelines && !lists[l][i]->n_fragments)
+                    lists[l][i]->last_seq_no = calc_max_seg_no(lists[l][i], c);
+    }
+
 finish:
+    if (ret)
+        c->is_live = was_live;
     // restore context
     if (c->base_url)
         av_free(base_url);
@@ -2425,6 +2443,13 @@ restart:
                 goto end;
             }
             av_log(v->parent, AV_LOG_WARNING, "Failed to open fragment of playlist\n");
+            /* A live SegmentTemplate with a duration is read by the clock,
+             * its manifest is not reloaded while segments come. A segment
+             * that is not there may be one after the end: the manifest says
+             * whether the presentation has ended (it is static then, and
+             * the representation is read to its end). */
+            if (c->is_live && !v->n_timelines && !v->n_fragments)
+                refresh_manifest(v->parent);
             if (++v->n_open_failures > c->max_reload) {
                 av_log(v->parent, AV_LOG_ERROR,
                        "Reached max consecutive fragment open failures (%d), giving up\n",
