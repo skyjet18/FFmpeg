@@ -3136,6 +3136,21 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
             else
                 ff_format_io_close(cur->parent, &cur->input);
             ret = reopen_demux_for_component(s, cur);
+            if (ret < 0 && ret != AVERROR_EXIT && !c->is_live && !cur->ctx &&
+                cur->cur_seq_no >= cur->last_seq_no) {
+                /* The last segment number of a SegmentTemplate with a
+                 * duration is computed from the duration of the
+                 * presentation in whole seconds and can be one past the
+                 * last segment there is. That it cannot be opened is the
+                 * end of this representation, not an error of the stream:
+                 * the others are read on. */
+                ff_format_io_close(cur->parent, &cur->input);
+                cur->inactive = 1;
+                cur->ended = 1;
+                av_log(s, AV_LOG_DEBUG, "No segment %"PRId64" on stream_index %d, taken as its end\n",
+                       cur->cur_seq_no, cur->stream_index);
+                return FFERROR_REDO;
+            }
         } else if (ret == AVERROR_EOF) {
             close_demux_for_component(cur);
             ff_format_io_close(cur->parent, &cur->input);
