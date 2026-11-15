@@ -2093,6 +2093,15 @@ static int read_data_continuous(void *opaque, uint8_t *buf, int buf_size)
     int segment_retries = 0;
     struct segment *seg;
 
+    /* A new discontinuity region waits for hls_read_packet() to restart the
+     * segment demuxer, which happens when that demuxer has returned its
+     * last packet and the end of its input. Until then there is no data of
+     * the new region: avio asks again after an end of file (avio_feof()),
+     * and the data handed out then would be parsed by the demuxer that was
+     * to be restarted, with the timestamp offset of the region before. */
+    if (v->discontinuity_pending)
+        return AVERROR_EOF;
+
     if (c->http_persistent && v->input_read_done) {
         ret = reload_playlist(v, c);
         if (ret < 0)
