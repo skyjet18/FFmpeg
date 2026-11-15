@@ -2598,7 +2598,15 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
     else if (c->cenc_decryption_keys)
         av_dict_set(&in_fmt_opts, "decryption_keys", c->cenc_decryption_keys, 0);
 
-    if(pls->type == AVMEDIA_TYPE_SUBTITLE && c->fake_last_subtitle)
+    /* The fake last subtitle is a packet with the largest timestamp: the
+     * end of the subtitles. A representation read in segments opens a
+     * demuxer for every segment; with the packet at the end of each of them
+     * the representation had the largest timestamp after its first segment
+     * and was not read again (dash_read_packet() reads the representation
+     * with the smallest one). Only the demuxer of the last segment gets it. */
+    if(pls->type == AVMEDIA_TYPE_SUBTITLE && c->fake_last_subtitle &&
+       (pls->n_fragments ? pls->cur_seq_no >= pls->n_fragments - 1 :
+                           !c->is_live && pls->cur_seq_no >= pls->last_seq_no))
     {
         av_dict_set(&in_fmt_opts, "fake_last_subtitle", "1", 0);
     }
