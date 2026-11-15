@@ -217,6 +217,124 @@ static void test_subtitle_discard(void)
     av_assert0(subtitle.discard == AVDISCARD_ALL);
 }
 
+/* A live presentation that ends: the reloaded manifest is static. */
+#define MPD_HEAD(type) "<?xml version=\"1.0\"?>\n" \
+    "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" " type \
+    " availabilityStartTime=\"1970-01-01T00:00:00Z\" minBufferTime=\"PT2S\">\n"
+#define MPD_VIDEO "<AdaptationSet contentType=\"video\" mimeType=\"video/mp4\">" \
+    "<Representation id=\"v\" bandwidth=\"1000\"><SegmentTemplate timescale=\"1000\" " \
+    "duration=\"2000\" startNumber=\"1\" media=\"v_$Number$.m4s\"/></Representation></AdaptationSet>\n"
+#define MPD_AUDIO(first, t) "<AdaptationSet contentType=\"audio\" mimeType=\"audio/mp4\">" \
+    "<Representation id=\"a\" bandwidth=\"100\"><SegmentTemplate timescale=\"1000\" " \
+    "startNumber=\"" first "\" media=\"a_$Number$.m4s\"><SegmentTimeline>" \
+    "<S t=\"" t "\" d=\"2000\" r=\"9\"/></SegmentTimeline></SegmentTemplate></Representation></AdaptationSet>\n"
+
+static const char live_mpd[] = MPD_HEAD("type=\"dynamic\" minimumUpdatePeriod=\"PT4S\"")
+    "<Period id=\"p0\" start=\"PT0S\">\n" MPD_VIDEO MPD_AUDIO("11", "20000") "</Period></MPD>\n";
+static const char ended_mpd[] = MPD_HEAD("type=\"static\" mediaPresentationDuration=\"PT60S\"")
+    "<Period id=\"p0\" start=\"PT0S\">\n" MPD_VIDEO MPD_AUDIO("21", "40000") "</Period></MPD>\n";
+static const char broken_mpd[] = MPD_HEAD("type=\"static\" mediaPresentationDuration=\"PT60S\"")
+    "</MPD>\n";
+
+static const char *mpd_text;
+static int mpd_pos, segment_opens;
+
+static int mpd_read(void *opaque, uint8_t *buf, int size)
+{
+    int left = strlen(mpd_text) - mpd_pos;
+
+    if (left <= 0)
+        return AVERROR_EOF;
+    size = FFMIN(size, left);
+    memcpy(buf, mpd_text + mpd_pos, size);
+    mpd_pos += size;
+    return size;
+}
+
+/* the manifest is mpd_text, every segment is missing */
+static int mpd_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
+                       int flags, AVDictionary **options)
+{
+    if (!av_match_ext(url, "mpd")) {
+        segment_opens++;
+        return AVERROR_HTTP_NOT_FOUND;
+    }
+    mpd_pos = 0;
+    *pb = avio_alloc_context(av_malloc(4096), 4096, 0, NULL, mpd_read, NULL, NULL);
+    return *pb ? 0 : AVERROR(ENOMEM);
+}
+
+static void test_live_to_static(void)
+{
+    AVIOInterruptCB interrupt = {.callback = test_interrupt};
+    DASHContext c = {.video_rep_index = -1, .audio_rep_index = -1, .max_reload = 2,
+                     .interrupt_callback = &interrupt, .live_start_time = AV_NOPTS_VALUE};
+    AVFormatContext s = {.priv_data = &c, .io_open = mpd_io_open, .io_close2 = test_io_close,
+                         .url = (char *)"http://localhost/live.mpd"};
+    struct representation *video, *audio;
+    struct fragment *seg;
+    uint8_t buf[64];
+
+    mpd_text = live_mpd;
+    av_assert0(!parse_manifest(&s, s.url, NULL) && c.is_live);
+    av_assert0(c.n_videos == 1 && c.n_audios == 1);
+    video = c.videos[0];
+    audio = c.audios[0];
+    /* as open_demux_for_component() does */
+    video->last_seq_no = calc_max_seg_no(video, &c);
+    audio->last_seq_no = calc_max_seg_no(audio, &c);
+    av_assert0(audio->last_seq_no == 20);
+    audio->cur_seq_no = 21;
+
+    /* SegmentTimeline: the static manifest gives the last segment, the
+     * representation ends there instead of waiting for a next one */
+    c.playlist_load_time = 0;
+    mpd_text = ended_mpd;
+    av_assert0(!refresh_manifest(&s));
+    av_assert0(!c.is_live);
+    av_assert0(audio->cur_seq_no == 21 && audio->last_seq_no == 30);
+    audio->cur_seq_no = 31;
+    av_assert0(!get_current_fragment(audio));
+    /* SegmentTemplate with a duration: the end of mediaPresentationDuration
+     * (one past the last segment, see dash_read_packet()) */
+    av_assert0(video->last_seq_no == 31);
+    video->cur_seq_no = 30;
+    seg = get_current_fragment(video);
+    av_assert0(seg && av_stristr(seg->url, "v_30.m4s"));
+    free_fragment(&seg);
+    video->cur_seq_no = 32;
+    av_assert0(!get_current_fragment(video));
+
+    /* a manifest that cannot be read does not end the presentation */
+    c.is_live = 1;
+    c.playlist_load_time = 0;
+    mpd_text = broken_mpd;
+    av_assert0(refresh_manifest(&s) < 0 && c.is_live);
+
+    /* A SegmentTemplate with a duration is read by the clock, its manifest
+     * is not reloaded while segments come: the segment after the end is
+     * missing, the reloaded manifest says that the presentation has ended,
+     * and the representation ends after that one segment. */
+    free_video_list(&c);
+    free_audio_list(&c);
+    av_freep(&c.base_url);
+    mpd_text = live_mpd;
+    av_assert0(!parse_manifest(&s, s.url, NULL) && c.is_live);
+    video = c.videos[0];
+    video->last_seq_no = calc_max_seg_no(video, &c);
+    c.playlist_load_time = 0;
+    mpd_text = ended_mpd;
+    segment_opens = 0;
+    av_assert0(read_data(video, buf, sizeof(buf)) == AVERROR_EOF);
+    av_assert0(!c.is_live && video->last_seq_no == 31);
+    /* the first open and its two retries, no further segment */
+    av_assert0(segment_opens == 3);
+
+    free_video_list(&c);
+    free_audio_list(&c);
+    av_freep(&c.base_url);
+}
+
 int main(void)
 {
     test_seek();
@@ -224,5 +342,6 @@ int main(void)
     test_live_start();
     test_duration_live_start();
     test_subtitle_discard();
+    test_live_to_static();
     return 0;
 }
