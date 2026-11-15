@@ -127,6 +127,8 @@ struct representation {
     int64_t cur_timestamp;
     int64_t first_pts;
     int inactive;        /* closed because its streams are discarded or ended */
+    int ended;           /* read to its end and closed: stays closed until a seek,
+                          * or until the caller discards and selects it again */
     int drop_pending;    /* switched in: drop the packets before drop_target */
     int64_t drop_target; /* in 90 kHz ticks, on the timeline of the returned packets */
     int is_restart_needed;
@@ -2947,7 +2949,9 @@ static void recheck_discard_flags(AVFormatContext *s, struct representation **p,
         for (int j = 0; j < pls->nb_assoc_stream; j++)
             needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
 
-        if (needed && !pls->ctx) {
+        if (!needed)
+            pls->ended = 0;
+        if (needed && !pls->ctx && !pls->ended) {
             int by_time = switch_in_by_time(c, pls);
             int64_t position = 0;
 
@@ -3137,9 +3141,10 @@ static int dash_read_packet(AVFormatContext *s, AVPacket *pkt)
             ff_format_io_close(cur->parent, &cur->input);
             cur->inactive = 1;
             av_log(s, AV_LOG_DEBUG, "EOF on stream_index %d\n", cur->stream_index);
-            // prevent recheck_discard_flags() from re-enabling the component
-            for (int i = 0; i < cur->nb_assoc_stream; i++)
-                cur->assoc_stream[i]->discard = AVDISCARD_ALL;
+            /* recheck_discard_flags() does not open it again. The discard
+             * flags of its streams stay as the caller set them: a seek
+             * reads the representation again. */
+            cur->ended = 1;
             return FFERROR_REDO;
         }
     }
@@ -3251,6 +3256,43 @@ set_seq_num:
     return ret;
 }
 
+/* Seek one representation. A closed one is only positioned (dry run) and
+ * opened when its streams are selected, with one exception: a representation
+ * that was closed because it was read to its end, and whose streams the
+ * caller still wants, is read again from the new position. A player that
+ * buffers ahead reaches the end of a short stream long before it has played
+ * it; its seeks must not be answered with the end of the stream. */
+static int seek_representation(AVFormatContext *s, struct representation *pls,
+                               int64_t seek_pos_msec, int flags)
+{
+    int dry_run = !pls->ctx;
+    int ret;
+
+    if (dry_run && pls->ended) {
+        int needed = !pls->nb_assoc_stream;
+
+        for (int j = 0; j < pls->nb_assoc_stream; j++)
+            needed |= pls->assoc_stream[j]->discard < AVDISCARD_ALL;
+        pls->ended = 0;
+        if (needed) {
+            pls->cur_seg_offset = 0;
+            pls->init_sec_buf_read_offset = 0;
+            pls->is_restart_needed = 0;
+            if (pls->n_fragments == 1) {
+                /* a single file is seeked in its demuxer, which is gone */
+                ret = reopen_demux_for_component(s, pls);
+                if (ret < 0)
+                    return ret;
+            }
+            dry_run = 0;
+        }
+    }
+    ret = dash_seek(s, pls, seek_pos_msec, flags, dry_run);
+    if (!dry_run && ret >= 0 && pls->ctx)
+        pls->inactive = 0;
+    return ret;
+}
+
 static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestamp, int flags)
 {
     int ret = 0, i;
@@ -3271,15 +3313,15 @@ static int dash_read_seek(AVFormatContext *s, int stream_index, int64_t timestam
     /* Seek in discarded streams with dry_run=1 to avoid reopening them */
     for (i = 0; i < c->n_videos; i++) {
         if (!ret)
-            ret = dash_seek(s, c->videos[i], seek_pos_msec, flags, !c->videos[i]->ctx);
+            ret = seek_representation(s, c->videos[i], seek_pos_msec, flags);
     }
     for (i = 0; i < c->n_audios; i++) {
         if (!ret)
-            ret = dash_seek(s, c->audios[i], seek_pos_msec, flags, !c->audios[i]->ctx);
+            ret = seek_representation(s, c->audios[i], seek_pos_msec, flags);
     }
     for (i = 0; i < c->n_subtitles; i++) {
         if (!ret)
-            ret = dash_seek(s, c->subtitles[i], seek_pos_msec, flags, !c->subtitles[i]->ctx);
+            ret = seek_representation(s, c->subtitles[i], seek_pos_msec, flags);
     }
     if (!ret)
         c->cur_timestamp = av_rescale(seek_pos_msec, 90, 1);
