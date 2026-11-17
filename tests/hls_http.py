@@ -107,6 +107,12 @@ class HlsHandler(http.server.BaseHTTPRequestHandler):
         root = self.server.root
         path = self.path.lstrip("/")
         self.server.requested.append(path)
+        unavailable = self.server.unavailable.get(path, 0)
+        if unavailable:
+            # a count of 503 answers before the file is served, -1: always
+            self.server.unavailable[path] = unavailable - (unavailable > 0)
+            self.send_error(503)
+            return
         match = re.fullmatch(r"track\d-(\d+)\.(?:ts|m4s)", path)
         if match:
             self.server.latest_segment = max(self.server.latest_segment, int(match[1]))
@@ -157,6 +163,7 @@ def serve(root, realtime=False, initial_window=0, tls=None):
         server.socket = tls.wrap_socket(server.socket, server_side=True)
     server.root = root
     server.requested = []
+    server.unavailable = {}
     server.latest_segment = 0
     server.windows = []
     server.realtime = realtime
@@ -193,6 +200,71 @@ def check_timeline(output, reference, initial):
         assert error <= 100000, (stage, kind, pts, sorted(expected), error)
         counts[int(kind)] += 1
     assert min(counts) > 100, counts
+
+
+def check_dead_key(ffmpeg):
+    """An AES-128 key that cannot be loaded is not requested again for every
+    try of every segment: a 404 once, a lasting 503 at most seg_max_retry + 1
+    times. A single 503 is still retried and the stream then plays."""
+    retries = 3
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-dead-key-") as directory:
+        root = Path(directory)
+        (root / "video.raw").write_bytes(bytes([96]) * (64 * 64 * 3 // 2 * 25 * 10))
+        (root / "audio.pcm").write_bytes(bytes(48000 * 4 * 10))
+        (root / "aes.key").write_bytes(bytes(range(16)))
+        (root / "keyinfo").write_text(f"aes.key\n{root / 'aes.key'}\n", encoding="ascii")
+        run(ffmpeg, "-y", "-f", "rawvideo", "-pixel_format", "yuv420p", "-video_size", "64x64",
+            "-framerate", "25", "-i", str(root / "video.raw"),
+            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", str(root / "audio.pcm"),
+            "-c:v", "mpeg2video", "-g", "25", "-bf", "0", "-c:a", "aac", "-b:a", "96k",
+            "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
+            "-hls_key_info_file", str(root / "keyinfo"),
+            "-hls_segment_filename", str(root / "aes-%03d.ts"), str(root / "aes.m3u8"))
+        playlist = (root / "aes.m3u8").read_text()
+        assert 'URI="aes.key"' in playlist, playlist
+        segments = {file.name for file in root.glob("aes-*.ts")}
+        assert len(segments) >= 8, segments
+        for name in ("dead", "busy", "flaky"):
+            (root / f"{name}.m3u8").write_text(
+                playlist.replace('URI="aes.key"', f'URI="{name}.key"'), encoding="ascii")
+        (root / "busy.key").write_bytes(bytes(range(16)))
+        (root / "flaky.key").write_bytes(bytes(range(16)))
+
+        server, thread = serve(root)
+        try:
+            for name, unavailable, max_retry, success, key_requests in (
+                    ("dead", 0, retries, False, 1),
+                    ("busy", -1, retries, False, retries + 1),
+                    ("flaky", 1, 1, True, 2)):
+                server.requested.clear()
+                server.unavailable = {f"{name}.key": unavailable} if unavailable else {}
+                result = subprocess.run(
+                    [ffmpeg, "-nostdin", "-hide_banner", "-v", "warning",
+                     "-seg_max_retry", str(max_retry),
+                     "-i", f"http://127.0.0.1:{server.server_port}/{name}.m3u8",
+                     "-map", "0", "-c", "copy", "-f", "null", "-"],
+                    capture_output=True, timeout=60)
+                log = result.stderr.decode(errors="replace")[-4000:]
+                count = server.requested.count(f"{name}.key")
+                # without the limit: one request per try of every segment
+                assert 1 <= count <= key_requests if not success else count == key_requests, (
+                    name, count, len(segments), log)
+                if success:
+                    assert result.returncode == 0, (name, log)
+                    assert segments <= set(server.requested), (
+                        name, sorted(segments - set(server.requested)), log)
+                else:
+                    # the error still ends the open, no segment was read
+                    assert result.returncode, (name, log)
+                    assert not segments & set(server.requested), (name, server.requested)
+                    assert "is not requested again" in log, (name, log)
+                answers = {0: "404", -1: "always 503", 1: "one 503"}[unavailable]
+                print(f"PASS HLS AES-128 key {name} ({answers}): "
+                      f"{count} key request(s) for {len(segments)} segments")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 def check_tls(ffmpeg):
@@ -285,6 +357,7 @@ def main():
                         help="Clock-driven windows, delayed external reactivation and nonzero initial window")
     args = parser.parse_args()
     if not args.realtime:
+        check_dead_key(args.ffmpeg)
         check_tls(args.ffmpeg)
     with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-http-") as directory:
         root = Path(directory)
