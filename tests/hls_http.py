@@ -412,6 +412,100 @@ def check_low_speed(ffmpeg):
               f"({trickle:.1f} s at the slow rate), all segments requested")
 
 
+def check_cenc(ffmpeg):
+    """HLS with CENC (cenc-aes-ctr) encrypted fMP4 segments: the key reaches
+    the mov demuxer of the segments with seg_format_options."""
+    key, kid = "00112233445566778899aabbccddeeff", "0f0e0d0c0b0a09080706050403020100"
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-cenc-") as directory:
+        root = Path(directory)
+        (root / "video.raw").write_bytes(b"".join(
+            bytes([16 + frame * 3 % 200]) * (64 * 64) + bytes([128]) * (64 * 64 // 2)
+            for frame in range(25 * 6)))
+        (root / "audio.pcm").write_bytes(b"".join(
+            struct.pack("<hh", value, value) for i in range(48000 * 6)
+            for value in [int(6000 * math.sin(2 * math.pi * 440 * i / 48000))]))
+        run(ffmpeg, "-y", "-f", "rawvideo", "-pixel_format", "yuv420p",
+            "-video_size", "64x64", "-framerate", "25", "-i", str(root / "video.raw"),
+            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", str(root / "audio.pcm"),
+            "-c:v", "mpeg4", "-g", "50", "-c:a", "aac", "-b:a", "96k", "-f", "mp4",
+            "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+            "-encryption_scheme", "cenc-aes-ctr", "-encryption_key", key,
+            "-encryption_kid", kid, str(root / "cenc.mp4"))
+
+        # split into an initialization section and one segment per fragment
+        data = (root / "cenc.mp4").read_bytes()
+        init, segments, position = b"", [], 0
+        while position < len(data):
+            size, kind = struct.unpack(">I4s", data[position:position + 8])
+            if size == 1:
+                size = struct.unpack(">Q", data[position + 8:position + 16])[0]
+            box = data[position:position + size]
+            position += size
+            if kind in (b"ftyp", b"moov"):
+                init += box
+            elif kind == b"moof":
+                segments.append(box)
+            elif kind == b"mdat":
+                segments[-1] += box
+        assert b"tenc" in init and len(segments) >= 3, (len(init), len(segments))
+        assert all(b"senc" in segment for segment in segments)
+        (root / "init.mp4").write_bytes(init)
+        playlist = ("#EXTM3U\n#EXT-X-VERSION:6\n#EXT-X-TARGETDURATION:2\n"
+                    "#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+                    '#EXT-X-KEY:METHOD=SAMPLE-AES-CTR,URI="data:text/plain;base64,AA==",'
+                    'KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",'
+                    'KEYFORMATVERSIONS="1"\n#EXT-X-MAP:URI="init.mp4"\n')
+        for index, segment in enumerate(segments):
+            (root / f"cenc-{index}.m4s").write_bytes(segment)
+            playlist += f"#EXTINF:2.0,\ncenc-{index}.m4s\n"
+        (root / "cenc.m3u8").write_text(playlist + "#EXT-X-ENDLIST\n", encoding="ascii")
+
+        # packet hashes with ffprobe: it lists the packets of encrypted
+        # streams too, which ffmpeg cannot set up without decoding them
+        ffprobe = str(Path(ffmpeg).with_name("ffprobe" + Path(ffmpeg).suffix))
+        if not Path(ffprobe).is_file():
+            print("SKIP HLS fMP4 cenc-aes-ctr: no ffprobe next to ffmpeg")
+            return
+
+        def hashes(source, *options):
+            output = run(ffprobe, "-v", "quiet", *options, "-show_data_hash", "MD5",
+                         "-show_entries", "packet=data_hash", "-of", "csv=p=0", source)
+            return sorted(line.strip() for line in output.splitlines() if line.strip())
+
+        reference = hashes(str(root / "cenc.mp4"), "-decryption_key", key)
+        encrypted = hashes(str(root / "cenc.mp4"))
+        assert len(reference) > 200 and len(set(reference) & set(encrypted)) < len(reference) // 10, (
+            "the file is not encrypted")
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        server.daemon_threads = True
+        server.root = root
+        server.requested = []
+        server.slow = set()
+        server.trickled = set()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_port}/cenc.m3u8"
+        try:
+            assert hashes(url) == encrypted, "HLS without a key"
+            result = subprocess.run([ffprobe, "-v", "warning", url], capture_output=True, timeout=60)
+            log = result.stderr.decode(errors="replace")
+            assert result.returncode == 0 and "Segments are encrypted with SAMPLE-AES-CTR (CENC), " \
+                "no decryption_key" in log, log[-4000:]
+            assert "key file" not in log, log[-4000:]
+            print("PASS HLS fMP4 cenc-aes-ctr without a key: the encrypted packets, one warning")
+            for option in (f"decryption_key={key}", f"decryption_keys={kid}={key}"):
+                assert hashes(url, "-seg_format_options", option) == reference, option
+                print(f"PASS HLS fMP4 cenc-aes-ctr with seg_format_options {option.split('=')[0]}: "
+                      f"{len(reference)} packets as decrypted from the file")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        requested = {path for path, _ in server.requested}
+        assert {"init.mp4", "cenc.m3u8"} | {f"cenc-{index}.m4s" for index in range(len(segments))} \
+            <= requested, requested
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ffmpeg", required=True)
@@ -422,6 +516,7 @@ def main():
     if not args.realtime:
         check_tls(args.ffmpeg)
         check_low_speed(args.ffmpeg)
+        check_cenc(args.ffmpeg)
     with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-http-") as directory:
         root = Path(directory)
         generate(root, args.ffmpeg, markers=True, duration=70 if args.realtime else 40,
