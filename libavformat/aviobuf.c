@@ -994,7 +994,8 @@ int ffio_copy_url_options(AVIOContext* pb, AVDictionary** avio_opts)
 {
     const char *opts[] = {
         "headers", "user_agent", "cookies", "http_proxy", "referer", "rw_timeout", "icy",
-        "tls_verify", "ca_file", "cert_file", "key_file", NULL };
+        "tls_verify", "ca_file", "cert_file", "key_file",
+        "low_speed_limit", "low_speed_time", NULL };
     const char **opt = opts;
     uint8_t *buf = NULL;
     int ret = 0;

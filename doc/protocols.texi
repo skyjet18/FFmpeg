@@ -589,6 +589,18 @@ If enabled, and a Retry-After header is encountered, its requested reconnection
 delay will be honored, rather than using exponential backoff. Useful for 429 and
 503 errors. Default enabled.
 
+@item low_speed_limit
+@itemx low_speed_time
+Fail a read of the body when the transfer rate stays below
+@option{low_speed_limit} bytes per second over @option{low_speed_time}
+seconds, as curl's options of the same names. Only the time spent waiting
+for data counts, so a reader that does not read for a while is not taken for
+a slow server. The read fails with a timeout error: with @option{reconnect}
+a resource of known size is reconnected at the current position, otherwise
+the error is returned. Both have to be set, 0 (the default) turns the check
+off. A connection that stops sending at all is caught by @option{rw_timeout}.
+HLS and DASH pass both options on to the connections of their segments.
+
 @item listen
 If set to 1 enables experimental HTTP server. This can be used to send data when
 used as an output option, or read data from a client with HTTP POST when used as
