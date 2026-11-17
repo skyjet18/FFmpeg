@@ -632,6 +632,13 @@ Use HTTP partial requests for downloading HTTP segments.
 @item seg_format_options
 Set options for the demuxer of media segments using a list of key=value pairs separated by @code{:}.
 
+fMP4 segments encrypted with ISO Common Encryption (cenc-aes-ctr,
+@code{#EXT-X-KEY:METHOD=SAMPLE-AES-CTR}, e.g. Widevine or PlayReady) are
+decrypted by the mov demuxer when the key is passed on here, as
+@code{decryption_key=@var{key}} or, by KID, @code{decryption_keys=@var{kid}=@var{key}}
+(one KID; both in hex). The KEY tag itself is not used for these; without one
+of the options a warning is logged and the packets stay encrypted.
+
 @item seg_max_retry
 Maximum number of times to reload a segment on error, useful when segment skip on network error is not desired.
 Default value is 0.

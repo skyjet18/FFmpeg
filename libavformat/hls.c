@@ -306,6 +306,7 @@ typedef struct HLSContext {
     int http_multiple;
     int http_seekable;
     int seg_max_retry;
+    int cenc_logged; /* the notice about CENC encrypted segments was logged */
     AVIOContext *playlist_pb;
     HLSCryptoContext  crypto_ctx;
     int hls_quality_mode;
@@ -488,7 +489,7 @@ static void handle_variant_args(void *context, const char *key,
 
 struct key_info {
      char uri[MAX_URL_SIZE];
-     char method[11];
+     char method[16]; /* the longest: SAMPLE-AES-CTR, ISO-23001-7 */
      char iv[35];
 };
 
@@ -1071,6 +1072,21 @@ static int parse_playlist(HLSContext *c, const char *url,
                 key_type = KEY_AES_128;
             if (!strcmp(info.method, "SAMPLE-AES"))
                 key_type = KEY_SAMPLE_AES;
+            if (!strcmp(info.method, "SAMPLE-AES-CTR") ||
+                !strcmp(info.method, "ISO-23001-7")) {
+                /* ISO Common Encryption (cenc) of fMP4 segments: the KEY
+                 * tag names a DRM system, there is no key to load here. The
+                 * mov demuxer of the segments decrypts them with the key
+                 * passed in seg_format_options. */
+                if (!c->cenc_logged) {
+                    int has_key = av_dict_get(c->seg_format_opts, "decryption_key", NULL, 0) ||
+                                  av_dict_get(c->seg_format_opts, "decryption_keys", NULL, 0);
+                    av_log(c->ctx, has_key ? AV_LOG_VERBOSE : AV_LOG_WARNING,
+                           "Segments are encrypted with %s (CENC)%s\n", info.method,
+                           has_key ? "" : ", no decryption_key or decryption_keys in seg_format_options");
+                    c->cenc_logged = 1;
+                }
+            }
             if (!av_strncasecmp(info.iv, "0x", 2)) {
                 ff_hex_to_data(iv, info.iv + 2);
                 has_iv = 1;
