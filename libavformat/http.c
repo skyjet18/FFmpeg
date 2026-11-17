@@ -35,6 +35,7 @@
 #include "libavutil/bprint.h"
 #include "libavutil/getenv_utf8.h"
 #include "libavutil/macros.h"
+#include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
@@ -158,6 +159,12 @@ typedef struct HTTPContext {
     int64_t sum_latency; /* divide by nb_requests */
     int64_t max_latency;
     int max_redirects;
+    /* low speed detection: bytes read and time spent waiting for them since
+     * the start of the current measurement window */
+    int low_speed_limit;
+    int low_speed_time;
+    int64_t low_speed_bytes;
+    int64_t low_speed_waited;
 } HTTPContext;
 
 #define OFFSET(x) offsetof(HTTPContext, x)
@@ -206,6 +213,8 @@ static const AVOption http_options[] = {
     { "reply_code", "The http status code to return to a client", OFFSET(reply_code), AV_OPT_TYPE_INT, { .i64 = 200}, INT_MIN, 599, E},
     { "short_seek_size", "Threshold to favor readahead over seek.", OFFSET(short_seek_size), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
     { "max_redirects", "Maximum number of redirects", OFFSET(max_redirects), AV_OPT_TYPE_INT, { .i64 = MAX_REDIRECTS }, 0, INT_MAX, D },
+    { "low_speed_limit", "fail a read if the transfer rate stays below this many bytes per second for low_speed_time seconds (0 = off)", OFFSET(low_speed_limit), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, D },
+    { "low_speed_time", "seconds of waiting for data over which the transfer rate is measured for low_speed_limit (0 = off)", OFFSET(low_speed_time), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX / 1000000, D },
     { NULL }
 };
 
@@ -409,6 +418,10 @@ static int http_open_cnx(URLContext *h, AVDictionary **options)
     int reconnect_delay_total = 0;
     uint64_t off;
     char *cached;
+
+    /* the transfer rate of a new connection is measured from its start */
+    s->low_speed_bytes  = 0;
+    s->low_speed_waited = 0;
 
 redo:
 
@@ -1714,6 +1727,38 @@ done:
     return err;
 }
 
+/**
+ * Low speed detection (low_speed_limit, low_speed_time), as curl's
+ * CURLOPT_LOW_SPEED_LIMIT / CURLOPT_LOW_SPEED_TIME: only the time spent
+ * waiting in reads of the body counts, so a reader that pauses (a full
+ * player buffer) is not taken for a slow server. Once low_speed_time
+ * seconds of waiting are collected, the rate over them is compared with
+ * the limit; then a new window starts.
+ *
+ * @return 0, or AVERROR(ETIMEDOUT) if the rate was below the limit
+ */
+static int http_check_low_speed(URLContext *h, int len, int64_t waited)
+{
+    HTTPContext *s = h->priv_data;
+    int64_t rate;
+
+    s->low_speed_bytes  += len;
+    s->low_speed_waited += FFMAX(waited, 0);
+    if (s->low_speed_waited < s->low_speed_time * INT64_C(1000000))
+        return 0;
+
+    rate = av_rescale(s->low_speed_bytes, 1000000, s->low_speed_waited);
+    s->low_speed_bytes  = 0;
+    s->low_speed_waited = 0;
+    if (rate >= s->low_speed_limit)
+        return 0;
+
+    av_log(h, AV_LOG_WARNING, "Low speed: %"PRId64" bytes/s over %d s, "
+           "below low_speed_limit %d bytes/s, at %"PRIu64"\n",
+           rate, s->low_speed_time, s->low_speed_limit, s->off);
+    return AVERROR(ETIMEDOUT);
+}
+
 static int http_buf_read(URLContext *h, uint8_t *buf, int size)
 {
     HTTPContext *s = h->priv_data;
@@ -1774,7 +1819,20 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
             return AVERROR_EOF;
         if (s->off == target_end && target_end < file_end)
             return AVERROR(EAGAIN); /* reached end of content range */
-        len = ffurl_read(s->hd, buf, size);
+        if (s->low_speed_limit > 0 && s->low_speed_time > 0) {
+            int64_t start = av_gettime_relative();
+            len = ffurl_read(s->hd, buf, size);
+            if (len > 0) {
+                int ret = http_check_low_speed(h, len, av_gettime_relative() - start);
+                if (ret < 0) {
+                    /* the connection is given up; the data of this read is
+                     * read again after a reconnect */
+                    ffurl_closep(&s->hd);
+                    return ret;
+                }
+            }
+        } else
+            len = ffurl_read(s->hd, buf, size);
         if ((!len || len == AVERROR_EOF) &&
             (!s->willclose || s->chunksize == UINT64_MAX) && s->off < target_end) {
             av_log(h, AV_LOG_ERROR,
