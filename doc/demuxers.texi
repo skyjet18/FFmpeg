@@ -298,6 +298,19 @@ streams. Disabled by default. Interactive players can enable this before
 probing to prevent sparse, unselected subtitles from starving audio/video,
 then set the chosen stream's discard flag to @code{AVDISCARD_DEFAULT}.
 
+@item inherit_manifest_query
+Add the query of the manifest URL (after redirects) to the URL of every
+segment and initialization section. Relative segment URLs lose the query of
+the manifest URL by the rules of URL resolution; CDNs that sign the manifest
+URL with a token often expect the same token on every segment. Disabled by
+default.
+
+@item url_add_query
+A query string, e.g. an access token, to add to the URL of every segment and
+initialization section, after the query of @option{inherit_manifest_query}.
+A leading @code{?} or @code{&} is ignored. A parameter the segment URL has
+already is not added a second time.
+
 @end table
 
 @section dvdvideo

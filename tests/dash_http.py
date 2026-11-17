@@ -20,6 +20,79 @@ def run(*arguments):
     return result.stdout.decode()
 
 
+def check_segment_query(ffmpeg, root):
+    """url_add_query and inherit_manifest_query reach every segment url."""
+    template = (root / "static.mpd").read_text()
+    assert 'media="chunk-stream' in template, template
+    # a manifest whose segment urls carry the token already
+    (root / "tokened.mpd").write_text(re.sub(
+        r'((?:media|initialization)="[^"?]+)"', r'\1?token=abc"', template))
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            path, _, query = self.path.partition("?")
+            requests.append(self.path)
+            file = root / path.lstrip("/")
+            status = 200
+            if not file.is_file():
+                status = 404
+            elif path.endswith(".m4s"):
+                parts = query.split("&") if query else []
+                if any(part not in parts for part in self.server.required):
+                    status = 403
+            payload = file.read_bytes() if status == 200 else b""
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *_):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        for manifest, options, required, expected_query, success in (
+            ("static.mpd?token=abc", (), ["token=abc"], "", False),
+            ("static.mpd?token=abc", ("-inherit_manifest_query", "1"), ["token=abc"],
+             "token=abc", True),
+            ("static.mpd", ("-url_add_query", "auth=x%2Fy"), ["auth=x%2Fy"],
+             "auth=x%2Fy", True),
+            ("static.mpd?token=abc", ("-inherit_manifest_query", "1", "-url_add_query", "?auth=1"),
+             ["token=abc", "auth=1"], "token=abc&auth=1", True),
+            ("tokened.mpd?token=abc", ("-inherit_manifest_query", "1"), ["token=abc"],
+             "token=abc", True),
+        ):
+            requests.clear()
+            server.required = required
+            result = subprocess.run(
+                [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-f", "dash", *options,
+                 "-i", f"{base}/{manifest}", "-map", "0", "-c", "copy", "-f", "null", "-"],
+                capture_output=True, timeout=60)
+            log = result.stderr.decode(errors="replace")[-4000:]
+            segments = [path for path in requests if ".m4s" in path]
+            assert segments, (manifest, options, requests, log)
+            assert all(path.partition("?")[2] == expected_query for path in segments), (
+                manifest, options, segments)
+            if success:
+                assert result.returncode == 0, (manifest, options, log)
+                assert len(segments) >= 10, segments
+            print(f"PASS DASH segment query manifest={manifest} options={list(options)}: "
+                  f"{len(segments)} segment requests with query '{expected_query}'")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ffmpeg", required=True)
@@ -34,6 +107,7 @@ def main():
             "-b:a:0", "64k", "-b:a:1", "96k", "-seg_duration", "1",
             "-use_template", "1", "-use_timeline", "1", "-adaptation_sets",
             "id=0,streams=0,1", "-f", "dash", str(root / "static.mpd"))
+        check_segment_query(args.ffmpeg, root)
         run(args.ffmpeg, "-y", "-f", "s16le", "-ar", "48000", "-ac", "2",
             "-i", str(audio), "-t", "3", "-c:a", "aac", "-seg_duration", "1",
             "-single_file", "1", "-f", "dash", str(root / "range.mpd"))
