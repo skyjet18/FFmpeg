@@ -212,6 +212,10 @@ typedef struct DASHContext {
     /* redirect learned from the CDN: requests to redirect_from go to redirect_to */
     char *redirect_from;
     char *redirect_to;
+    /* Option: query string added to the url of every segment */
+    char *url_add_query;
+    /* Option: add the query of the manifest url to the url of every segment */
+    int inherit_manifest_query;
 } DASHContext;
 
 static int ishttp(char *url)
@@ -2251,6 +2255,81 @@ static int read_from_url(struct representation *pls, struct fragment *seg,
     return ret;
 }
 
+/* 1 if part is one of the &-separated parameters of query or a run of them */
+static int query_has_part(const char *query, const char *part)
+{
+    size_t len = strlen(part);
+
+    for (const char *p = query; (p = strstr(p, part)); p++)
+        if ((p == query || p[-1] == '&') && (p[len] == '\0' || p[len] == '&'))
+            return 1;
+    return 0;
+}
+
+/**
+ * Add the query of the manifest url (inherit_manifest_query) and
+ * url_add_query to the query of a segment url, before a fragment. A part
+ * that the url has already (e.g. a BaseURL that carries the token) is not
+ * added again.
+ */
+static int add_segment_query(DASHContext *c, char **url)
+{
+    char *parts[2] = { NULL, NULL };
+    const char *fragment;
+    AVBPrint bp;
+    char *out;
+    int ret = 0;
+
+    if (c->inherit_manifest_query && c->base_url && strchr(c->base_url, '?')) {
+        const char *query = strchr(c->base_url, '?') + 1;
+        parts[0] = av_strndup(query, strcspn(query, "#"));
+        if (!parts[0])
+            return AVERROR(ENOMEM);
+    }
+    if (c->url_add_query) {
+        parts[1] = av_strdup(c->url_add_query + strspn(c->url_add_query, "?&"));
+        if (!parts[1]) {
+            ret = AVERROR(ENOMEM);
+            goto end;
+        }
+    }
+    if ((!parts[0] || !*parts[0]) && (!parts[1] || !*parts[1]))
+        goto end;
+
+    fragment = strchr(*url, '#');
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
+    av_bprint_append_data(&bp, *url, fragment ? fragment - *url : strlen(*url));
+    for (int i = 0; i < 2; i++) {
+        const char *query, *sep;
+        char last;
+        if (!parts[i] || !*parts[i] || !av_bprint_is_complete(&bp))
+            continue;
+        query = strchr(bp.str, '?');
+        if (query && query_has_part(query + 1, parts[i]))
+            continue;
+        last = bp.len ? bp.str[bp.len - 1] : '\0';
+        sep  = !query ? "?" : (last == '?' || last == '&') ? "" : "&";
+        av_bprintf(&bp, "%s%s", sep, parts[i]);
+    }
+    if (fragment)
+        av_bprintf(&bp, "%s", fragment);
+    if (!av_bprint_is_complete(&bp)) {
+        av_bprint_finalize(&bp, NULL);
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+    ret = av_bprint_finalize(&bp, &out);
+    if (ret < 0)
+        goto end;
+    av_free(*url);
+    *url = out;
+
+end:
+    av_free(parts[0]);
+    av_free(parts[1]);
+    return ret;
+}
+
 static int open_input(DASHContext *c, struct representation *pls, struct fragment *seg)
 {
     AVDictionary *opts = NULL;
@@ -2272,6 +2351,10 @@ static int open_input(DASHContext *c, struct representation *pls, struct fragmen
     }
 
     ff_make_absolute_url(url, c->max_url_size, c->base_url, seg->url);
+
+    ret = add_segment_query(c, &url);
+    if (ret < 0)
+        goto cleanup;
 
     is_http = segment_is_http(url);
     if (!is_http)
@@ -3420,6 +3503,10 @@ static const AVOption dash_options[] = {
     { "fake_last_subtitle", "Insert fake last subtitle to prevent subtitle stream end befor audio/video", OFFSET(fake_last_subtitle), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     { "max_reload", "Maximum number of manifest reloads in get_current_fragment() before giving up",
         OFFSET(max_reload), AV_OPT_TYPE_INT, { .i64 = 100 }, 0, INT_MAX, FLAGS },
+    { "url_add_query", "query string to add to the url of every segment (e.g. an access token)",
+        OFFSET(url_add_query), AV_OPT_TYPE_STRING, { .str = NULL }, 0, 0, FLAGS },
+    { "inherit_manifest_query", "add the query of the manifest url to the url of every segment",
+        OFFSET(inherit_manifest_query), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     {NULL}
 };
 
