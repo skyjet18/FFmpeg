@@ -6,6 +6,8 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
+import ssl
 import struct
 import subprocess
 import tempfile
@@ -104,6 +106,7 @@ class HlsHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         root = self.server.root
         path = self.path.lstrip("/")
+        self.server.requested.append(path)
         match = re.fullmatch(r"track\d-(\d+)\.(?:ts|m4s)", path)
         if match:
             self.server.latest_segment = max(self.server.latest_segment, int(match[1]))
@@ -148,9 +151,12 @@ class HlsHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def serve(root, realtime=False, initial_window=0):
+def serve(root, realtime=False, initial_window=0, tls=None):
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HlsHandler)
+    if tls:
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
     server.root = root
+    server.requested = []
     server.latest_segment = 0
     server.windows = []
     server.realtime = realtime
@@ -189,6 +195,88 @@ def check_timeline(output, reference, initial):
     assert min(counts) > 100, counts
 
 
+def check_tls(ffmpeg):
+    """The TLS options of the master playlist reach variant playlists, keys and segments."""
+    if not shutil.which("openssl") or not re.search(
+            r"^\s*https$", run(ffmpeg, "-hide_banner", "-protocols"), re.M):
+        print("SKIP HLS over https: no openssl tool or no https protocol")
+        return
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-tls-") as directory:
+        root = Path(directory)
+
+        def openssl(*arguments):
+            run("openssl", *arguments)
+
+        openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "2",
+                "-subj", "/CN=FFmpeg test CA", "-keyout", str(root / "ca.key"),
+                "-out", str(root / "ca.pem"),
+                "-addext", "basicConstraints=critical,CA:TRUE",
+                "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+        for serial, (name, usage) in enumerate((("server", "serverAuth"),
+                                                ("client", "clientAuth")), 1):
+            (root / f"{name}.ext").write_text(
+                "basicConstraints=CA:FALSE\nsubjectKeyIdentifier=hash\n"
+                "authorityKeyIdentifier=keyid,issuer\n"
+                f"extendedKeyUsage={usage}\nsubjectAltName=IP:127.0.0.1\n",
+                encoding="ascii")
+            openssl("req", "-newkey", "rsa:2048", "-nodes", "-subj", f"/CN={name}",
+                    "-keyout", str(root / f"{name}.key"), "-out", str(root / f"{name}.csr"))
+            openssl("x509", "-req", "-days", "2", "-set_serial", str(serial),
+                    "-in", str(root / f"{name}.csr"), "-CA", str(root / "ca.pem"),
+                    "-CAkey", str(root / "ca.key"), "-extfile", str(root / f"{name}.ext"),
+                    "-out", str(root / f"{name}.pem"))
+
+        (root / "video.raw").write_bytes(bytes([96]) * (64 * 64 * 3 // 2 * 25 * 6))
+        (root / "audio.pcm").write_bytes(bytes(48000 * 4 * 6))
+        (root / "aes.key").write_bytes(bytes(range(16)))
+        (root / "keyinfo").write_text(f"aes.key\n{root / 'aes.key'}\n", encoding="ascii")
+        run(ffmpeg, "-y", "-f", "rawvideo", "-pixel_format", "yuv420p", "-video_size", "64x64",
+            "-framerate", "25", "-i", str(root / "video.raw"),
+            "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", str(root / "audio.pcm"),
+            "-c:v", "mpeg2video", "-g", "25", "-bf", "0", "-c:a", "aac", "-b:a", "96k",
+            "-f", "hls", "-hls_time", "2", "-hls_list_size", "0",
+            "-hls_key_info_file", str(root / "keyinfo"),
+            "-hls_segment_filename", str(root / "tls-%03d.ts"), str(root / "tls.m3u8"))
+        assert "#EXT-X-KEY:METHOD=AES-128" in (root / "tls.m3u8").read_text()
+        (root / "master.m3u8").write_text(
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=500000\ntls.m3u8\n", encoding="ascii")
+        expected = {"master.m3u8", "tls.m3u8", "aes.key"} | {
+            file.name for file in root.glob("tls-*.ts")}
+        assert len(expected) >= 6, expected
+        ca = ("-ca_file", str(root / "ca.pem"))
+        client = ("-cert_file", str(root / "client.pem"), "-key_file", str(root / "client.key"))
+
+        for client_auth, options, success in ((False, (), False), (False, ca, True),
+                                              (True, ca, False), (True, ca + client, True)):
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(root / "server.pem", root / "server.key")
+            if client_auth:
+                context.verify_mode = ssl.CERT_REQUIRED
+                context.load_verify_locations(root / "ca.pem")
+            server, thread = serve(root, tls=context)
+            try:
+                result = subprocess.run(
+                    [ffmpeg, "-nostdin", "-hide_banner", "-v", "warning", *options,
+                     "-i", f"https://127.0.0.1:{server.server_port}/master.m3u8",
+                     "-map", "0", "-c", "copy", "-f", "null", "-"],
+                    capture_output=True, timeout=60)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+            state = (client_auth, [option for option in options if option.startswith("-")])
+            log = result.stderr.decode(errors="replace")[-4000:]
+            if success:
+                assert result.returncode == 0, (state, log)
+                assert set(server.requested) == expected, (
+                    state, sorted(expected - set(server.requested)), log)
+            else:
+                # the certificate is checked: the master playlist itself fails
+                assert result.returncode and not server.requested, (state, server.requested, log)
+            print(f"PASS HLS over https client_auth={client_auth} options={state[1]}: "
+                  + ("all playlists, keys and segments read" if success else "refused"))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ffmpeg", required=True)
@@ -196,6 +284,8 @@ def main():
     parser.add_argument("--realtime", action="store_true",
                         help="Clock-driven windows, delayed external reactivation and nonzero initial window")
     args = parser.parse_args()
+    if not args.realtime:
+        check_tls(args.ffmpeg)
     with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-http-") as directory:
         root = Path(directory)
         generate(root, args.ffmpeg, markers=True, duration=70 if args.realtime else 40,
