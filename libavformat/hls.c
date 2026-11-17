@@ -193,6 +193,14 @@ struct playlist {
     char key_url[MAX_URL_SIZE];
     uint8_t key[16];
 
+    /* The key URL whose requests failed, how often in a row and the error of
+     * the last try. Once it counts as failed for good (key_failed_for_good())
+     * it is not requested again for the following segments until the
+     * playlist is reloaded or a segment names another key. */
+    char key_fail_url[MAX_URL_SIZE];
+    int key_fail_count;
+    int key_fail_ret;
+
     /* ID3 timestamp handling (elementary audio streams have ID3 timestamps
      * (and possibly other ID3 tags) in the beginning of each segment) */
     int is_id3_timestamped; /* -1: not yet known */
@@ -1050,6 +1058,8 @@ static int parse_playlist(HLSContext *c, const char *url,
 
         pls->finished = 0;
         pls->type = PLS_TYPE_UNSPECIFIED;
+        /* a reloaded playlist may serve the key again */
+        pls->key_fail_count = 0;
     }
     while (!avio_feof(in)) {
         ff_get_chomp_line(in, line, sizeof(line));
@@ -1722,6 +1732,44 @@ static void intercept_id3(struct playlist *pls, uint8_t *buf,
         pls->is_id3_timestamped = (pls->id3_mpegts_timestamp != AV_NOPTS_VALUE);
 }
 
+/* Whether the key URL of pls->key_fail_url is not requested again. An answer
+ * that will not change (a 4xx other than 429, a missing file, a key of the
+ * wrong size) counts at once, other errors (5xx, timeouts) after as many
+ * failures in a row as one segment is tried, at least three. Without this
+ * every try of every segment requests the dead key again: seg_max_retry + 1
+ * requests per segment, a burst over the whole playlist. */
+static int key_failed_for_good(HLSContext *c, struct playlist *pls)
+{
+    int ret = pls->key_fail_ret;
+
+    if (!pls->key_fail_count)
+        return 0;
+    if (ret == AVERROR_HTTP_BAD_REQUEST || ret == AVERROR_HTTP_UNAUTHORIZED ||
+        ret == AVERROR_HTTP_FORBIDDEN   || ret == AVERROR_HTTP_NOT_FOUND    ||
+        ret == AVERROR_HTTP_OTHER_4XX   || ret == AVERROR(ENOENT)           ||
+        ret == AVERROR_INVALIDDATA)
+        return 1;
+    return pls->key_fail_count >= FFMAX(c->seg_max_retry + 1, 3);
+}
+
+static int key_failed(HLSContext *c, struct playlist *pls, struct segment *seg, int ret)
+{
+    /* an interrupted request says nothing about the key */
+    if (ret == AVERROR_EXIT)
+        return ret;
+    if (!pls->key_fail_count || strcmp(pls->key_fail_url, seg->key)) {
+        av_strlcpy(pls->key_fail_url, seg->key, sizeof(pls->key_fail_url));
+        pls->key_fail_count = 0;
+    }
+    pls->key_fail_count++;
+    pls->key_fail_ret = ret;
+    if (key_failed_for_good(c, pls))
+        av_log(pls->parent, AV_LOG_WARNING,
+               "Key file %s is not requested again until the playlist is reloaded\n",
+               seg->key);
+    return ret;
+}
+
 static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
 {
     AVIOContext *pb = NULL;
@@ -1746,6 +1794,10 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
         return 0;
     }
 
+    if (pls->key_fail_count && !strcmp(pls->key_fail_url, seg->key) &&
+        key_failed_for_good(c, pls))
+        return pls->key_fail_ret;
+
     if (c->key_uri_replace_old && c->key_uri_replace_new &&
         c->key_uri_replace_old[0]) {
         key_url = av_strireplace(seg->key, c->key_uri_replace_old, c->key_uri_replace_new);
@@ -1761,7 +1813,7 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
     if (ret < 0) {
         av_log(pls->parent, AV_LOG_ERROR, "Unable to open key file %s, %s\n",
                seg->key, av_err2str(ret));
-        return ret;
+        return key_failed(c, pls, seg, ret);
     }
 
     ret = avio_read(pb, pls->key, sizeof(pls->key));
@@ -1776,9 +1828,10 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
             ret = AVERROR_INVALIDDATA;
         }
 
-        return ret;
+        return key_failed(c, pls, seg, ret);
     }
 
+    pls->key_fail_count = 0;
     av_strlcpy(pls->key_url, seg->key, sizeof(pls->key_url));
 
     return 0;
