@@ -190,6 +190,17 @@ struct playlist {
     unsigned int init_sec_data_len;
     unsigned int init_sec_buf_read_offset;
 
+    /* The start of the segment that skip_image_head() read: head_buf holds
+     * head_len bytes, read_from_url() returns those from head_pos on before
+     * it reads the input again. head_check: a segment was started on the
+     * input and is not checked yet. */
+    uint8_t *head_buf;
+    unsigned int head_buf_size;
+    int head_len;
+    int head_pos;
+    int head_check;
+    int head_logged;
+
     char key_url[MAX_URL_SIZE];
     uint8_t key[16];
 
@@ -307,6 +318,7 @@ typedef struct HLSContext {
     char *allowed_extensions;
     char *allowed_segment_extensions;
     int extension_picky;
+    int skip_image_head;
     int max_reload;
     char *key_uri_replace_old;
     char *key_uri_replace_new;
@@ -368,6 +380,7 @@ static void free_playlist_list(HLSContext *c)
         av_dict_free(&pls->timed_id3_metadata);
         ff_id3v2_free_extra_meta(&pls->id3_deferred_extra);
         av_freep(&pls->init_sec_buf);
+        av_freep(&pls->head_buf);
         av_packet_free(&pls->pkt);
         av_freep(&pls->pb.pub.buffer);
         ff_format_io_close(c->ctx, &pls->input);
@@ -1515,8 +1528,8 @@ static int64_t range_end(struct playlist *pls, const struct segment *seg)
     return seg->url_offset + seg->size;
 }
 
-static int read_from_url(struct playlist *pls, struct segment *seg,
-                         uint8_t *buf, int buf_size)
+static int read_from_input(struct playlist *pls, struct segment *seg,
+                           uint8_t *buf, int buf_size)
 {
     int ret;
 
@@ -1529,6 +1542,121 @@ static int read_from_url(struct playlist *pls, struct segment *seg,
         pls->cur_seg_offset += ret;
 
     return ret;
+}
+
+static int read_from_url(struct playlist *pls, struct segment *seg,
+                         uint8_t *buf, int buf_size)
+{
+    /* what skip_image_head() read of the segment comes first */
+    if (pls->head_pos < pls->head_len) {
+        int len = FFMIN(buf_size, pls->head_len - pls->head_pos);
+        memcpy(buf, pls->head_buf + pls->head_pos, len);
+        pls->head_pos += len;
+        return len;
+    }
+
+    return read_from_input(pls, seg, buf, buf_size);
+}
+
+static void drop_segment_head(struct playlist *pls)
+{
+    pls->head_len   = 0;
+    pls->head_pos   = 0;
+    pls->head_check = 0;
+}
+
+/*
+ * Some CDNs serve MPEG-TS segments disguised as pictures: a small PNG, JPEG,
+ * GIF or WebP image in front of the TS packets of every segment, served from
+ * an image host. Probed, the first segment is taken for the picture
+ * (png_pipe, webp_pipe, ...); inside the stream, the picture is garbage the
+ * mpegts demuxer resyncs over, and may take for packets.
+ *
+ * A segment that starts with one of these signatures and holds a run of
+ * IMAGE_HEAD_PACKETS TS packets that starts within its first
+ * IMAGE_HEAD_SEARCH bytes is read from the first packet of that run.
+ * Anything else, plain TS, fMP4, packed audio, an image without TS packets
+ * behind it, is passed on unchanged; only the first 12 bytes are looked at
+ * then. The check runs on what the segment demuxer gets, the decrypted
+ * data of an AES-128 segment.
+ *
+ * Detection and limits as in hlsdl 0.34 (strip_disguise_prefix(), commit
+ * 12ba4d1 of Masta2002/e2iplayer-deps), which does the same on the data it
+ * writes.
+ */
+#define IMAGE_HEAD_SIGNATURE 12
+#define IMAGE_HEAD_SEARCH    (64 * 1024)
+#define IMAGE_HEAD_TS_PACKET 188
+/* more packets in a row than a probe needs: this cuts data off, and image
+ * data may hold 0x47 bytes 188 apart by chance */
+#define IMAGE_HEAD_PACKETS   5
+
+static const char *image_head_type(const uint8_t *d)
+{
+    if (!memcmp(d, "\x89PNG\r\n\x1a\n", 8))
+        return "PNG";
+    if (d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF)
+        return "JPEG";
+    if (!memcmp(d, "GIF8", 4))
+        return "GIF";
+    if (!memcmp(d, "RIFF", 4) && !memcmp(d + 8, "WEBP", 4))
+        return "WebP";
+    return NULL;
+}
+
+static int grow_segment_head(struct playlist *pls, int size)
+{
+    uint8_t *buf = av_fast_realloc(pls->head_buf, &pls->head_buf_size, size);
+    if (!buf)
+        return AVERROR(ENOMEM);
+    pls->head_buf = buf;
+    return 0;
+}
+
+static int skip_image_head(struct playlist *pls, struct segment *seg)
+{
+    const int size = IMAGE_HEAD_SEARCH + IMAGE_HEAD_PACKETS * IMAGE_HEAD_TS_PACKET;
+    const char *type = NULL;
+    int len = 0, ret = 0, start, k;
+
+    drop_segment_head(pls);
+
+    if ((ret = grow_segment_head(pls, IMAGE_HEAD_SIGNATURE)) < 0)
+        return ret;
+    while (len < IMAGE_HEAD_SIGNATURE &&
+           (ret = read_from_input(pls, seg, pls->head_buf + len, IMAGE_HEAD_SIGNATURE - len)) > 0)
+        len += ret;
+    pls->head_len = len;
+    if (len < IMAGE_HEAD_SIGNATURE || !(type = image_head_type(pls->head_buf)))
+        return 0;
+
+    if ((ret = grow_segment_head(pls, size)) < 0)
+        return ret;
+    while (len < size &&
+           (ret = read_from_input(pls, seg, pls->head_buf + len, size - len)) > 0)
+        len += ret;
+    pls->head_len = len;
+
+    for (start = 1; start + (IMAGE_HEAD_PACKETS - 1) * IMAGE_HEAD_TS_PACKET < len; start++) {
+        for (k = 0; k < IMAGE_HEAD_PACKETS; k++)
+            if (pls->head_buf[start + k * IMAGE_HEAD_TS_PACKET] != 0x47)
+                break;
+        if (k == IMAGE_HEAD_PACKETS)
+            break;
+    }
+    if (start + (IMAGE_HEAD_PACKETS - 1) * IMAGE_HEAD_TS_PACKET >= len) {
+        av_log(pls->parent, AV_LOG_VERBOSE,
+               "Segment %s starts with a %s image without MPEG-TS packets behind it\n",
+               seg->url, type);
+        return 0;
+    }
+
+    pls->head_pos = start;
+    av_log(pls->parent, pls->head_logged ? AV_LOG_DEBUG : AV_LOG_INFO,
+           "Skipped a %s image of %d bytes in front of the MPEG-TS data of segment %s\n",
+           type, start, seg->url);
+    pls->head_logged = 1;
+    return 0;
 }
 
 /* Parse the raw ID3 data and pass contents to caller */
@@ -2146,6 +2274,7 @@ static int discontinuity_restart(HLSContext *c, struct playlist *v, struct segme
     ff_format_io_close(v->parent, &v->input_next);
     v->input_next_end = -1;
     v->input_next_requested = 0;
+    drop_segment_head(v);
     /* a seek back into the region left reuses its offset */
     disc_offset_store(c, v, v->active_discontinuity_sequence, v->discontinuity_offset);
     v->active_discontinuity_sequence = seg->discontinuity_sequence;
@@ -2224,6 +2353,8 @@ restart:
         segment_retries = 0;
         just_opened = 1;
         v->input_read_done = 0;
+        drop_segment_head(v);
+        v->head_check = 1;
     }
 
     if (c->http_multiple == -1) {
@@ -2261,6 +2392,14 @@ restart:
     }
 
     seg = current_segment(v);
+    if (v->head_check) {
+        v->head_check = 0;
+        if (c->skip_image_head && !v->is_subtitle) {
+            ret = skip_image_head(v, seg);
+            if (ret < 0)
+                return ret;
+        }
+    }
     ret = read_from_url(v, seg, buf, buf_size);
     if (ret > 0) {
         if (just_opened && v->is_id3_timestamped != 0) {
@@ -2278,6 +2417,8 @@ restart:
         c->cur_seq_no = v->cur_seq_no;
         v->cur_seg_offset = 0;
         just_opened = 1;
+        drop_segment_head(v);
+        v->head_check = 1;
         goto restart;
     }
     /* Keep the connection for the next request only if its reply was read
@@ -3181,6 +3322,7 @@ static int hls_read_header(AVFormatContext *s)
             pls->input_next = NULL;
             pls->input_next_requested = 0;
             pls->cur_seg_offset = 0;
+            drop_segment_head(pls);
             pls->cur_init_section = NULL;
             /* Reset EOF flag */
             pls->pb.pub.eof_reached = 0;
@@ -3333,6 +3475,7 @@ static void reset_playlist(struct playlist *pls)
     pls->input_read_done = 0;
     ff_format_io_close(pls->parent, &pls->input_next);
     pls->input_next_requested = 0;
+    drop_segment_head(pls);
     av_packet_unref(pls->pkt);
     pb->eof_reached = 0;
     /* an error of the old position is not the one of the new position */
@@ -3397,6 +3540,7 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             pls->input_read_done = 0;
             ff_format_io_close(pls->parent, &pls->input_next);
             pls->input_next_requested = 0;
+            drop_segment_head(pls);
             if (pls->is_subtitle)
                 avformat_close_input(&pls->ctx);
             pls->needed = 0;
@@ -3924,6 +4068,8 @@ static const AVOption hls_options[] = {
         INT_MIN, INT_MAX, FLAGS},
     {"extension_picky", "Be picky with all extensions matching",
         OFFSET(extension_picky), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
+    {"skip_image_head", "Read segments that start with a PNG, JPEG, GIF or WebP image from the MPEG-TS data behind it",
+        OFFSET(skip_image_head), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, FLAGS},
     {"max_reload", "Maximum number of times a insufficient list is attempted to be reloaded",
         OFFSET(max_reload), AV_OPT_TYPE_INT, {.i64 = 100}, 0, INT_MAX, FLAGS},
     {"key_uri_old", "allow to replace part of AES key uri - old", OFFSET(key_uri_replace_old), AV_OPT_TYPE_STRING, { .str = "" }, 0, 0, FLAGS},
