@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import zlib
 
 
 def run(*arguments):
@@ -128,7 +129,7 @@ class HlsHandler(http.server.BaseHTTPRequestHandler):
                     + "".join(re.findall(r"#EXT-X-MAP:[^\n]+\n", original))
                     + "".join(segments[start:start + 5])).encode()
         else:
-            file = root / path
+            file = root / path.split("?", 1)[0]
             if not file.is_file():
                 self.send_error(404)
                 return
@@ -324,6 +325,128 @@ def main():
                         assert max(server.windows) > 0, server.windows
                     print(f"PASS mixed-TS HLS live={live} initial={initial}: "
                           "seven selections with selected audio and video progress")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+    if not args.realtime:
+        check_image_head(args.ffmpeg)
+
+
+def image_heads():
+    """Pictures as servers put them in front of MPEG-TS segments, each with
+    0x47 bytes 188 apart four times in its data (one packet short of the run
+    that marks the TS start)."""
+    def decoy(size):
+        data = bytearray((i * 7 + 3) % 256 for i in range(size))
+        data = bytearray(0x46 if b == 0x47 else b for b in data)
+        for k in range(4):
+            data[100 + k * 188] = 0x47
+        return bytes(data)
+
+    def chunk(kind, payload):
+        return (struct.pack(">I", len(payload)) + kind + payload
+                + struct.pack(">I", zlib.crc32(kind + payload) & 0xffffffff))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + chunk(b"IHDR", struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0))
+           + chunk(b"tEXt", b"Comment\0" + decoy(1500))
+           + chunk(b"IDAT", zlib.compress(b"".join(b"\0" + b"\x80" * 48 for _ in range(16))))
+           + chunk(b"IEND", b""))
+    payload = decoy(1501) + b"\0"
+    webp = (b"RIFF" + struct.pack("<I", 4 + 8 + len(payload)) + b"WEBP"
+            + b"VP8L" + struct.pack("<I", 1501) + payload)
+    filler = decoy(40000)
+    jpeg = (b"\xff\xd8\xff\xe0" + struct.pack(">H", 16) + b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0"
+            + b"\xff\xfe" + struct.pack(">H", len(filler) + 2) + filler + b"\xff\xd9")
+    return {"PNG": png, "WebP": webp, "JPEG": jpeg}
+
+
+def check_image_head(ffmpeg):
+    """Segments with foreign names and a picture in front of the MPEG-TS data
+    are read from the TS data on (skip_image_head), plain and AES-128; the
+    packets are those of the same segments without the pictures. Plain TS and
+    fMP4 segments are read unchanged, and without the option the pictures
+    are not skipped."""
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-image-head-") as directory:
+        root = Path(directory)
+        (root / "video.raw").write_bytes(bytes([96]) * (64 * 64 * 3 // 2 * 25 * 6))
+        (root / "audio.pcm").write_bytes(bytes(48000 * 4 * 6))
+        sources = ("-f", "rawvideo", "-pixel_format", "yuv420p", "-video_size", "64x64",
+                   "-framerate", "25", "-i", str(root / "video.raw"),
+                   "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", str(root / "audio.pcm"),
+                   "-c:v", "mpeg2video", "-g", "25", "-bf", "0", "-c:a", "aac", "-b:a", "96k",
+                   "-f", "hls", "-hls_time", "2", "-hls_list_size", "0")
+        run(ffmpeg, "-y", *sources, "-hls_segment_filename", str(root / "plain-%03d.ts"),
+            str(root / "plain.m3u8"))
+        run(ffmpeg, "-y", *sources, "-hls_segment_type", "fmp4",
+            "-hls_fmp4_init_filename", "fmp4-init.mp4",
+            "-hls_segment_filename", str(root / "fmp4-%03d.m4s"), str(root / "fmp4.m3u8"))
+        playlist = (root / "plain.m3u8").read_text()
+        segments = re.findall(r"^(plain-\d+\.ts)$", playlist, re.M)
+        assert len(segments) >= 3, playlist
+        heads = image_heads()
+        key, iv = bytes(range(16)), bytes(range(16, 32))
+        (root / "aes.key").write_bytes(key)
+        openssl = shutil.which("openssl")
+        variants = [("js", "PNG", "seg{}.js", False),
+                    ("noext", "WebP", "s/{}?token=0123abcd", False),
+                    ("jpeg", "JPEG", "video{}.jpeg", False)]
+        if openssl:
+            variants.append(("aes", "PNG", "img{}.png", True))
+        else:
+            print("SKIP image head with AES-128: no openssl tool")
+        (root / "s").mkdir()
+        for name, kind, pattern, encrypted in variants:
+            text = playlist
+            if encrypted:
+                text = text.replace("#EXTINF", f'#EXT-X-KEY:METHOD=AES-128,URI="aes.key",'
+                                               f'IV=0x{iv.hex()}\n#EXTINF', 1)
+            for number, segment in enumerate(segments):
+                uri = pattern.format(f"{name}{number}")
+                data = heads[kind] + (root / segment).read_bytes()
+                file = root / uri.split("?", 1)[0]
+                if encrypted:
+                    file.with_suffix(".plain").write_bytes(data)
+                    run(openssl, "enc", "-aes-128-cbc", "-K", key.hex(), "-iv", iv.hex(),
+                        "-in", str(file.with_suffix(".plain")), "-out", str(file))
+                else:
+                    file.write_bytes(data)
+                text = re.sub(rf"^{re.escape(segment)}$", lambda _: uri, text, flags=re.M)
+            (root / f"{name}.m3u8").write_text(text, encoding="ascii")
+
+        server, thread = serve(root)
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def packets(name, *options):
+            result = subprocess.run(
+                [ffmpeg, "-nostdin", "-hide_banner", "-v", "info", "-extension_picky", "0",
+                 *options, "-i", f"{base}/{name}.m3u8", "-map", "0", "-c", "copy",
+                 "-f", "framecrc", "-"], capture_output=True, timeout=60)
+            lines = [line for line in result.stdout.decode().splitlines()
+                     if line and not line.startswith("#")]
+            return result.returncode, lines, result.stderr.decode(errors="replace")
+
+        try:
+            code, reference, log = packets("plain")
+            assert code == 0 and len(reference) > 100, (code, log[-4000:])
+            assert "Skipped a" not in log, log[-4000:]
+            for name, kind, pattern, encrypted in variants:
+                code, lines, log = packets(name)
+                assert code == 0 and lines == reference, (name, code, len(lines), log[-4000:])
+                skipped = re.findall(r"Skipped a (\w+) image of (\d+) bytes", log)
+                assert skipped == [(kind, str(len(heads[kind])))], (name, skipped, log[-4000:])
+                code, lines, log = packets(name, "-skip_image_head", "0")
+                assert code != 0 or lines != reference, (name, log[-4000:])
+                print(f"PASS HLS image head {kind} in front of segments named {pattern}"
+                      + (" with AES-128" if encrypted else "")
+                      + ": skipped, the packets of the plain segments; not skipped with the option off")
+            for name in ("plain", "fmp4"):
+                code, on, log = packets(name)
+                assert code == 0 and len(on) > 100 and "Skipped a" not in log, (name, code, log[-4000:])
+                code, off, log = packets(name, "-skip_image_head", "0")
+                assert code == 0 and on == off, (name, code, log[-4000:])
+                print(f"PASS HLS {name} segments read unchanged with skip_image_head")
         finally:
             server.shutdown()
             server.server_close()
