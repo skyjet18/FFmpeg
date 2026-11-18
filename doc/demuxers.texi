@@ -1000,6 +1000,24 @@ Default 16-byte key, in hex, to decrypt files encrypted using ISO Common Encrypt
 Dictionary of 16-byte key ID => 16-byte key, both in hex, to decrypt files encrypted using ISO Common Encryption
 (CENC/AES-128 CTR; ISO/IEC 23001-7).
 
+@item decryption_key_url
+URL template that is opened for the key of a key ID that @option{decryption_keys} does not have.
+@code{@{kid@}} is replaced by the key ID (32 lowercase hex digits), @code{@{type@}} by the type of the
+track (@code{video}, @code{audio}, @code{subtitle}, @code{data}) and @code{@{pssh@}} by the base64 of the
+@code{pssh} boxes that apply to the key ID (whole boxes one after the other, @code{+}, @code{/} and
+@code{=} percent-escaped). The answer is the key: 16 bytes, or 32 hex digits.
+Every key ID is requested once; without a key the packets of that key ID fail
+(with @option{decryption_key} set, it is used instead).
+
+The URL is opened with the @code{io_open} callback of the outermost format context, so an
+application can answer the request itself. For a demuxer opened by the DASH or HLS demuxer
+that is the one of the DASH or HLS context. The protocol whitelist of that context applies: a
+local file only allows @code{file,crypto,data}.
+
+@item decryption_pssh
+@code{pssh} boxes in base64, separated by commas, that are added to @code{@{pssh@}} of
+@option{decryption_key_url}. Set by the DASH demuxer from the manifest.
+
 @item max_stts_delta
 Very high sample deltas written in a trak's stts box may occasionally be intended but usually they are written in
 error or used to store a negative value for dts correction when treated as signed 32-bit integers. This option lets
