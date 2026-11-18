@@ -292,6 +292,14 @@ Default 16-byte key, in hex, to decrypt files encrypted using ISO Common Encrypt
 Dictionary of 16-byte key ID => 16-byte key, both in hex, to decrypt files encrypted using ISO Common Encryption
 (CENC/AES-128 CTR; ISO/IEC 23001-7).
 
+@item cenc_decryption_key_url
+URL template that the demuxers of the representations open for the key of a key ID
+that @option{cenc_decryption_keys} does not have; see @option{decryption_key_url} of
+the mov demuxer. The requests go through the @code{io_open} callback of this
+context; every key ID is requested once for the whole stream. The @code{cenc:pssh}
+boxes of the @code{ContentProtection} elements of the AdaptationSet and the
+Representation are part of @code{@{pssh@}}.
+
 @item dash_subtitle_default_discard
 Initially discard all manifest subtitle representations, including unprobed
 streams. Disabled by default. Interactive players can enable this before
@@ -651,6 +659,11 @@ of the options a warning is logged and the packets stay encrypted.
 @item seg_max_retry
 Maximum number of times to reload a segment on error, useful when segment skip on network error is not desired.
 Default value is 0.
+
+@item cenc_decryption_key_url
+URL template that the mov demuxer of fMP4 segments in CENC opens for the key of a key ID it
+has no key for; see @option{decryption_key_url} of the mov demuxer. The requests go through
+the @code{io_open} callback of this context; every key ID is requested once.
 @end table
 
 @section image2

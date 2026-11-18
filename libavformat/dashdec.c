@@ -137,6 +137,7 @@ struct representation {
 
     char *cenc_decryption_key;
     char *cenc_decryption_keys;
+    char *cenc_pssh; /* base64 pssh boxes of the ContentProtection elements, comma separated */
     enum AVMediaType type;
 };
 
@@ -183,6 +184,7 @@ typedef struct DASHContext {
     char *cenc_decryption_keys;
     char *cenc_decryption_video_key;
     char *cenc_decryption_audio_key;
+    char *cenc_decryption_key_url;
     int audioRepIdx;
     int videoRepIdx;
     int audio_rep_index;
@@ -440,6 +442,7 @@ static void free_representation(struct representation *pls)
     av_freep(&pls->id);
     av_freep(&pls->cenc_decryption_key);
     av_freep(&pls->cenc_decryption_keys);
+    av_freep(&pls->cenc_pssh);
     av_freep(&pls);
 }
 
@@ -762,6 +765,47 @@ static xmlNodePtr find_child_node_by_name(xmlNodePtr rootnode, const char *noden
         node = xmlNextElementSibling(node);
     }
     return NULL;
+}
+
+/**
+ * Add the cenc:pssh boxes (base64) of the ContentProtection elements of node
+ * to the comma separated list *pssh, each box once.
+ */
+static int add_content_protection_pssh(char **pssh, xmlNodePtr node)
+{
+    for (xmlNodePtr cp = node ? xmlFirstElementChild(node) : NULL; cp; cp = xmlNextElementSibling(cp)) {
+        if (av_strcasecmp(cp->name, "ContentProtection"))
+            continue;
+        for (xmlNodePtr box = xmlFirstElementChild(cp); box; box = xmlNextElementSibling(box)) {
+            char *text, *b64, *joined;
+            int len = 0;
+
+            if (av_strcasecmp(box->name, "pssh"))
+                continue;
+            text = xmlNodeGetContent(box);
+            if (!text)
+                continue;
+            b64 = av_strdup(text);
+            xmlFree(text);
+            if (!b64)
+                return AVERROR(ENOMEM);
+            for (char *r = b64; *r; r++)
+                if (!av_isspace(*r))
+                    b64[len++] = *r;
+            b64[len] = 0;
+            if (!len || (*pssh && strstr(*pssh, b64))) {
+                av_free(b64);
+                continue;
+            }
+            joined = *pssh ? av_asprintf("%s,%s", *pssh, b64) : av_strdup(b64);
+            av_free(b64);
+            if (!joined)
+                return AVERROR(ENOMEM);
+            av_free(*pssh);
+            *pssh = joined;
+        }
+    }
+    return 0;
 }
 
 static enum AVMediaType get_content_type(xmlNodePtr node)
@@ -1209,6 +1253,11 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
         if (!rep->cenc_decryption_keys)
             goto enomem;
     }
+
+    if (c->cenc_decryption_key_url &&
+        (add_content_protection_pssh(&rep->cenc_pssh, adaptionset_node) < 0 ||
+         add_content_protection_pssh(&rep->cenc_pssh, representation_node) < 0))
+        goto enomem;
 
     baseurl_nodes[0] = mpd_baseurl_node;
     baseurl_nodes[1] = period_baseurl_node;
@@ -2666,6 +2715,13 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
 
     pls->ctx->pb = &pls->pb.pub;
     pls->ctx->io_open  = nested_io_open;
+    ffformatcontext(pls->ctx)->cenc_key_parent = s;
+
+    if (c->cenc_decryption_key_url) {
+        av_dict_set(&in_fmt_opts, "decryption_key_url", c->cenc_decryption_key_url, 0);
+        if (pls->cenc_pssh)
+            av_dict_set(&in_fmt_opts, "decryption_pssh", pls->cenc_pssh, 0);
+    }
 
     if (pls->cenc_decryption_key)
         av_dict_set(&in_fmt_opts, "decryption_key", pls->cenc_decryption_key, 0);
@@ -3497,6 +3553,8 @@ static const AVOption dash_options[] = {
     { "cenc_decryption_keys", "Media decryption keys by KID (hex)", OFFSET(cenc_decryption_keys), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_video_key", "Media decryption video key scheme_cenc (hex)", OFFSET(cenc_decryption_video_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
     { "cenc_decryption_audio_key", "Media decryption audio key scheme_cenc (hex)", OFFSET(cenc_decryption_audio_key), AV_OPT_TYPE_STRING, {.str = NULL}, INT_MIN, INT_MAX, .flags = FLAGS },
+    { "cenc_decryption_key_url", "URL that is opened for the key of a KID cenc_decryption_keys does not have ({kid}, {type}, {pssh}; see decryption_key_url of the mov demuxer)",
+        OFFSET(cenc_decryption_key_url), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, .flags = FLAGS },
     { "live_delay", "distance to the live edge in seconds when starting a live stream (0 = automatic)", OFFSET(live_delay), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 3600, .flags = FLAGS },
     { "dash_subtitle_default_discard", "Initially discard all subtitle representations until selected by the caller", OFFSET(subtitle_default_discard), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, .flags = FLAGS },
     { "http_persistent", "Use persistent HTTP connections", OFFSET(http_persistent), AV_OPT_TYPE_BOOL, { .i64 = 1 }, 0, 1, .flags = FLAGS },
