@@ -315,6 +315,7 @@ typedef struct HLSContext {
     AVIOInterruptCB *interrupt_callback;
     AVDictionary *avio_opts;
     AVDictionary *seg_format_opts;
+    char *cenc_decryption_key_url;
     char *allowed_extensions;
     char *allowed_segment_extensions;
     int extension_picky;
@@ -3260,6 +3261,7 @@ static int hls_read_header(AVFormatContext *s)
 
         if (!(pls->ctx = avformat_alloc_context()))
             return AVERROR(ENOMEM);
+        ffformatcontext(pls->ctx)->cenc_key_parent = s;
 
         if (pls->n_segments == 0)
             continue;
@@ -3399,6 +3401,8 @@ static int hls_read_header(AVFormatContext *s)
             return ret;
 
         av_dict_copy(&options, c->seg_format_opts, 0);
+        if (c->cenc_decryption_key_url && *c->cenc_decryption_key_url && strstr(in_fmt->name, "mov"))
+            av_dict_set(&options, "decryption_key_url", c->cenc_decryption_key_url, 0);
 
         ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, &options);
         av_dict_free(&options);
@@ -4082,6 +4086,8 @@ static const AVOption hls_options[] = {
         OFFSET(http_multiple), AV_OPT_TYPE_BOOL, {.i64 = -1}, -1, 1, FLAGS},
     {"http_seekable", "Use HTTP partial requests, 0 = disable, 1 = enable, -1 = auto",
         OFFSET(http_seekable), AV_OPT_TYPE_BOOL, { .i64 = -1}, -1, 1, FLAGS},
+    {"cenc_decryption_key_url", "URL that is opened for the key of a KID of fMP4 segments in CENC ({kid}, {type}, {pssh}; see decryption_key_url of the mov demuxer)",
+        OFFSET(cenc_decryption_key_url), AV_OPT_TYPE_STRING, {.str = NULL}, 0, 0, FLAGS},
     {"seg_format_options", "Set options for segment demuxer",
         OFFSET(seg_format_opts), AV_OPT_TYPE_DICT, {.str = NULL}, 0, 0, FLAGS},
     {"seg_max_retry", "Maximum number of times to reload a segment on error.",
