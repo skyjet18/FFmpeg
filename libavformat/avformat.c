@@ -187,6 +187,7 @@ void avformat_free_context(AVFormatContext *s)
     av_freep(&s->chapters);
     av_dict_free(&s->metadata);
     av_dict_free(&si->id3v2_meta);
+    av_dict_free(&si->cenc_keys);
     av_packet_free(&si->pkt);
     av_packet_free(&si->parse_pkt);
     ff_packet_list_free(&si->packet_buffer);
