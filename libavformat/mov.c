@@ -39,6 +39,7 @@
 #include "libavutil/mathematics.h"
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
+#include "libavutil/base64.h"
 #include "libavutil/dict.h"
 #include "libavutil/display.h"
 #include "libavutil/mem.h"
@@ -67,6 +68,7 @@
 #include "dovi_isom.h"
 #include "riff.h"
 #include "isom.h"
+#include "url.h"
 #include "libavcodec/get_bits.h"
 #include "id3v1.h"
 #include "mov_chan.h"
@@ -8331,17 +8333,278 @@ static int mov_read_dfla(MOVContext *c, AVIOContext *pb, MOVAtom atom)
     return 0;
 }
 
-static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, AVEncryptionInfo *sample) {
+/* Whether the pssh boxes in buf (size bytes, whole boxes) contain box. */
+static int pssh_box_listed(const uint8_t *buf, unsigned size, const uint8_t *box, unsigned box_size)
+{
+    unsigned pos = 0;
+
+    while (size - pos >= 8) {
+        unsigned len = AV_RB32(buf + pos);
+        if (len < 8 || len > size - pos)
+            break;
+        if (len == box_size && !memcmp(buf + pos, box, len))
+            return 1;
+        pos += len;
+    }
+    return 0;
+}
+
+/* Whether a pssh box (size bytes, checked) applies to the KID: a version 0
+ * box applies to every KID, a version 1 box to the KIDs it lists. */
+static int pssh_box_for_kid(const uint8_t *box, unsigned size, const uint8_t *kid)
+{
+    unsigned count;
+
+    if (size < 32 || AV_RB32(box) != size || AV_RL32(box + 4) != MKTAG('p','s','s','h'))
+        return 0;
+    if (!box[8])
+        return 1;
+    count = AV_RB32(box + 28);
+    if (count > (size - 32) / 16)
+        return 0;
+    for (unsigned i = 0; i < count; i++)
+        if (!memcmp(box + 32 + 16 * i, kid, 16))
+            return 1;
+    return 0;
+}
+
+static void pssh_box_add(AVBPrint *boxes, const uint8_t *box, unsigned size, const uint8_t *kid)
+{
+    if (pssh_box_for_kid(box, size, kid) &&
+        !pssh_box_listed((const uint8_t *)boxes->str, boxes->len, box, size))
+        av_bprint_append_data(boxes, box, size);
+}
+
+/**
+ * The pssh boxes that apply to a KID, as whole boxes one after the other:
+ * the ones given with decryption_pssh (from the manifest), then the ones of
+ * the moov and moof boxes read so far.
+ */
+static void cenc_collect_pssh(MOVContext *c, const uint8_t *kid, AVBPrint *boxes)
+{
+    const char *p = c->decryption_pssh;
+
+    while (p && *p) {
+        size_t len = strcspn(p, ",");
+        int size = AV_BASE64_DECODE_SIZE(len);
+        uint8_t *box = av_malloc(size + 1);
+        char *text = av_strndup(p, len);
+
+        if (box && text) {
+            size = av_base64_decode(box, text, size);
+            if (size > 0)
+                pssh_box_add(boxes, box, size, kid);
+        }
+        av_free(box);
+        av_free(text);
+        p += len;
+        if (*p == ',')
+            p++;
+    }
+
+    for (unsigned i = 0; i < c->fc->nb_streams; i++) {
+        const AVCodecParameters *par = c->fc->streams[i]->codecpar;
+        const AVPacketSideData *sd = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
+                                                             AV_PKT_DATA_ENCRYPTION_INIT_INFO);
+        AVEncryptionInitInfo *list;
+
+        if (!sd || !(list = av_encryption_init_info_get_side_data(sd->data, sd->size)))
+            continue;
+        for (AVEncryptionInitInfo *info = list; info; info = info->next) {
+            uint64_t size = 32 + (info->num_key_ids ? 4 + 16ULL * info->num_key_ids : 0) + info->data_size;
+            uint8_t *box, *w;
+
+            if (info->system_id_size != 16 || size > 1 << 20 ||
+                (info->num_key_ids && info->key_id_size != 16))
+                continue;
+            box = av_malloc(size);
+            if (!box)
+                break;
+            AV_WB32(box, size);
+            AV_WL32(box + 4, MKTAG('p','s','s','h'));
+            AV_WB32(box + 8, info->num_key_ids ? 1 << 24 : 0);
+            memcpy(box + 12, info->system_id, 16);
+            w = box + 28;
+            if (info->num_key_ids) {
+                AV_WB32(w, info->num_key_ids);
+                w += 4;
+                for (unsigned j = 0; j < info->num_key_ids; j++, w += 16)
+                    memcpy(w, info->key_ids[j], 16);
+            }
+            AV_WB32(w, info->data_size);
+            if (info->data_size)
+                memcpy(w + 4, info->data, info->data_size);
+            pssh_box_add(boxes, box, size, kid);
+            av_free(box);
+        }
+        av_encryption_init_info_free(list);
+    }
+}
+
+/* base64, with the characters that have a meaning in a URL escaped */
+static void bprint_base64_url(AVBPrint *bp, const uint8_t *data, unsigned size)
+{
+    char *b64;
+
+    if (!size)
+        return;
+    b64 = av_malloc(AV_BASE64_SIZE(size));
+    if (!b64)
+        return;
+    av_base64_encode(b64, AV_BASE64_SIZE(size), data, size);
+    for (const char *p = b64; *p; p++) {
+        if (*p == '+' || *p == '/' || *p == '=')
+            av_bprintf(bp, "%%%02X", *p);
+        else
+            av_bprint_chars(bp, *p, 1);
+    }
+    av_free(b64);
+}
+
+/**
+ * Ask for the key of a KID that decryption_keys does not have: the
+ * decryption_key_url template is filled in and opened with io_open of the
+ * outermost context (for a demuxer of a DASH representation or HLS playlist
+ * the one of the DASH or HLS demuxer, i.e. the caller's). The answer is the
+ * key, 16 bytes or 32 hex digits. Every KID is asked for once; the answer
+ * (also "no key") is kept in that outermost context, so the other
+ * representations and playlists use it as well.
+ *
+ * @return 0 with the key in out, AVERROR(EACCES) if there is no key,
+ *         AVERROR_EXIT if the request was interrupted
+ */
+static int cenc_request_key(MOVContext *c, MOVStreamContext *sc, const uint8_t *kid, uint8_t *out, int len)
+{
+    AVFormatContext *top = c->fc;
+    FFFormatContext *si;
+    const AVDictionaryEntry *known;
+    AVDictionary *opts = NULL;
+    AVIOContext *pb = NULL;
+    AVBPrint url, boxes;
+    const char *type = "data";
+    const char *p;
+    char kid_hex[33], key_hex[33];
+    uint8_t answer[128];
+    int ret, size = 0;
+
+    while (ffformatcontext(top)->cenc_key_parent)
+        top = ffformatcontext(top)->cenc_key_parent;
+    si = ffformatcontext(top);
+
+    ff_data_to_hex(kid_hex, kid, 16, 1);
+    known = av_dict_get(si->cenc_keys, kid_hex, NULL, AV_DICT_MATCH_CASE);
+    if (known) {
+        if (strlen(known->value) != (size_t)len * 2)
+            return AVERROR(EACCES);
+        ff_hex_to_data(out, known->value);
+        return 0;
+    }
+
+    if (sc->ffindex >= 0 && sc->ffindex < c->fc->nb_streams) {
+        const char *name = av_get_media_type_string(c->fc->streams[sc->ffindex]->codecpar->codec_type);
+        if (name)
+            type = name;
+    }
+
+    av_bprint_init(&url, 0, AV_BPRINT_SIZE_UNLIMITED);
+    for (p = c->decryption_key_url; *p; p++) {
+        if (av_strstart(p, "{kid}", NULL)) {
+            av_bprintf(&url, "%s", kid_hex);
+            p += 4;
+        } else if (av_strstart(p, "{type}", NULL)) {
+            av_bprintf(&url, "%s", type);
+            p += 5;
+        } else if (av_strstart(p, "{pssh}", NULL)) {
+            av_bprint_init(&boxes, 0, AV_BPRINT_SIZE_UNLIMITED);
+            cenc_collect_pssh(c, kid, &boxes);
+            if (av_bprint_is_complete(&boxes))
+                bprint_base64_url(&url, (const uint8_t *)boxes.str, boxes.len);
+            av_bprint_finalize(&boxes, NULL);
+            p += 5;
+        } else {
+            av_bprint_chars(&url, *p, 1);
+        }
+    }
+    if (!av_bprint_is_complete(&url)) {
+        av_bprint_finalize(&url, NULL);
+        return AVERROR(ENOMEM);
+    }
+
+    av_log(c->fc, AV_LOG_VERBOSE, "Requesting the key of KID %s (%s)\n", kid_hex, type);
+    if (top->pb)
+        ffio_copy_url_options(top->pb, &opts);
+    ret = top->io_open(top, &pb, url.str, AVIO_FLAG_READ, &opts);
+    av_dict_free(&opts);
+    av_bprint_finalize(&url, NULL);
+    while (ret >= 0 && size < sizeof(answer)) {
+        ret = avio_read(pb, answer + size, sizeof(answer) - size);
+        if (ret > 0) {
+            size += ret;
+        } else if (!ret || ret == AVERROR_EOF) {
+            ret = 0;
+            break;
+        }
+    }
+    if (pb)
+        ff_format_io_close(top, &pb);
+    if (ret == AVERROR_EXIT || ff_check_interrupt(&top->interrupt_callback))
+        return AVERROR_EXIT;
+
+    if (ret >= 0) {
+        /* 16 bytes are the key itself; otherwise 32 hex digits, maybe
+         * with white space around them */
+        if (size == len) {
+            ff_data_to_hex(key_hex, answer, len, 1);
+        } else {
+            int start = 0, end = size;
+            while (start < end && av_isspace(answer[start]))
+                start++;
+            while (end > start && av_isspace(answer[end - 1]))
+                end--;
+            if (end - start != len * 2) {
+                ret = AVERROR_INVALIDDATA;
+            } else {
+                for (int i = start; i < end; i++)
+                    if (!av_isxdigit(answer[i]))
+                        ret = AVERROR_INVALIDDATA;
+                memcpy(key_hex, answer + start, len * 2);
+                key_hex[len * 2] = 0;
+            }
+        }
+    }
+
+    if (ret < 0) {
+        /* with decryption_key that one is used, it is not an error */
+        int level = c->decryption_default_key ? AV_LOG_VERBOSE : AV_LOG_ERROR;
+        av_dict_set(&si->cenc_keys, kid_hex, "", 0);
+        if (ret == AVERROR_INVALIDDATA)
+            av_log(c->fc, level, "No key for KID %s: the answer (%d bytes) is not a key\n",
+                   kid_hex, size);
+        else
+            av_log(c->fc, level, "No key for KID %s: %s\n", kid_hex, av_err2str(ret));
+        return AVERROR(EACCES);
+    }
+
+    ret = av_dict_set(&si->cenc_keys, kid_hex, key_hex, 0);
+    if (ret < 0)
+        return ret;
+    ff_hex_to_data(out, key_hex);
+    av_log(c->fc, AV_LOG_VERBOSE, "Got the key of KID %s\n", kid_hex);
+    return 0;
+}
+
+static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, MOVStreamContext *sc, AVEncryptionInfo *sample) {
     AVDictionaryEntry *key_entry_hex;
     char kid_hex[16*2+1];
     size_t key_entry_len;
+    int ret;
 
     if (c->decryption_default_key && c->decryption_default_key_len != len) {
         av_log(c->fc, AV_LOG_ERROR, "invalid default decryption key length: got %d, expected %d\n", c->decryption_default_key_len, len);
         return -1;
     }
 
-    if (!c->decryption_keys) {
+    if (!c->decryption_keys && !c->decryption_key_url) {
         if (!c->decryption_default_key) {
             /* possible when only decryption_video_key/decryption_audio_key is set */
             av_log(c->fc, AV_LOG_ERROR, "no decryption key for this stream\n");
@@ -8359,6 +8622,13 @@ static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, AVEncryptionIn
 
     ff_data_to_hex(kid_hex, sample->key_id, 16, 1);
     key_entry_hex = av_dict_get(c->decryption_keys, kid_hex, NULL, AV_DICT_DONT_STRDUP_KEY|AV_DICT_DONT_STRDUP_VAL);
+
+    if (!key_entry_hex && c->decryption_key_url) {
+        /* the default key is the answer to a KID that has none */
+        ret = cenc_request_key(c, sc, sample->key_id, out, len);
+        if (ret != AVERROR(EACCES) || !c->decryption_default_key)
+            return ret;
+    }
 
     if (!key_entry_hex) {
         if (!c->decryption_default_key) {
@@ -8420,7 +8690,7 @@ static int cenc_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
         }
 
         if (!have_stream_key) {
-            ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sample);
+            ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sc, sample);
             if (ret < 0) {
                 return ret;
             }
@@ -8481,7 +8751,7 @@ static int cbc1_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
     uint8_t decryption_key[16];
 
     if (!sc->cenc.aes_ctx) {
-        ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sample);
+        ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sc, sample);
         if (ret < 0) {
             return ret;
         }
@@ -8546,7 +8816,7 @@ static int cens_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
     uint8_t decryption_key[AES_CTR_KEY_SIZE];
 
     if (!sc->cenc.aes_ctr) {
-        ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sample);
+        ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sc, sample);
         if (ret < 0) {
             return ret;
         }
@@ -8618,7 +8888,7 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
     uint8_t decryption_key[16];
 
     if (!sc->cenc.aes_ctx) {
-        ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sample);
+        ret = get_key_from_kid(decryption_key, sizeof(decryption_key), c, sc, sample);
         if (ret < 0) {
             return ret;
         }
@@ -8684,6 +8954,19 @@ static int cbcs_scheme_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryption
 
 static int cenc_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryptionInfo *sample, uint8_t *input, int size)
 {
+    /* The cipher of a track is set up with the key of the first sample that
+     * is decrypted. A sample with another KID (key rotation, a new tenc after
+     * a switch of the initialization segment) needs the key of its KID. */
+    if (sample->key_id_size == sizeof(sc->cenc.key_id)) {
+        if ((sc->cenc.aes_ctr || sc->cenc.aes_ctx) &&
+            memcmp(sc->cenc.key_id, sample->key_id, sizeof(sc->cenc.key_id))) {
+            av_aes_ctr_free(sc->cenc.aes_ctr);
+            sc->cenc.aes_ctr = NULL;
+            av_freep(&sc->cenc.aes_ctx);
+        }
+        memcpy(sc->cenc.key_id, sample->key_id, sizeof(sc->cenc.key_id));
+    }
+
     if (sample->scheme == MKBETAG('c','e','n','c') && !sample->crypt_byte_block && !sample->skip_byte_block) {
         return cenc_scheme_decrypt(c, sc, sample, input, size);
     } else if (sample->scheme == MKBETAG('c','b','c','1') && !sample->crypt_byte_block && !sample->skip_byte_block) {
@@ -8776,9 +9059,17 @@ static int cenc_filter(MOVContext *mov, AVStream* st, MOVStreamContext *sc, AVPa
             return AVERROR_INVALIDDATA;
         }
 
-        if (mov->decryption_keys || mov->decryption_default_key || mov->decryption_video_key || mov->decryption_audio_key) {
-            return cenc_decrypt(mov, sc, encrypted_sample, pkt->data, pkt->size);
-        } else {
+        if (mov->decryption_keys || mov->decryption_default_key || mov->decryption_video_key || mov->decryption_audio_key ||
+            mov->decryption_key_url) {
+            ret = cenc_decrypt(mov, sc, encrypted_sample, pkt->data, pkt->size);
+            /* A KID that has no key after the request: the packet is
+             * returned encrypted, with its encryption info, as without any
+             * key. The caller learns which stream it is and can drop that
+             * stream instead of losing the whole read. */
+            if (ret != AVERROR(EACCES) || !mov->decryption_key_url)
+                return ret;
+        }
+        {
             size_t size;
             uint8_t *side_data = av_encryption_info_add_side_data(encrypted_sample, &size);
             if (!side_data)
@@ -10390,6 +10681,7 @@ static void mov_free_stream_context(AVFormatContext *s, AVStream *st)
     mov_free_encryption_index(&sc->cenc.encryption_index);
     av_encryption_info_free(sc->cenc.default_encrypted_sample);
     av_aes_ctr_free(sc->cenc.aes_ctr);
+    av_freep(&sc->cenc.aes_ctx);
 
     av_freep(&sc->stereo3d);
     av_freep(&sc->spherical);
@@ -11328,6 +11620,9 @@ static int mov_read_header(AVFormatContext *s)
     MOVAtom atom = { AV_RL32("root") };
     int i;
 
+    if (mov->decryption_key_url && !*mov->decryption_key_url)
+        av_freep(&mov->decryption_key_url);
+
     if (mov->decryption_video_key_len != 0 && mov->decryption_video_key_len != AES_CTR_KEY_SIZE) {
         av_log(s, AV_LOG_ERROR, "Invalid decryption video key len %d expected %d\n",
             mov->decryption_video_key_len, AES_CTR_KEY_SIZE);
@@ -12253,6 +12548,10 @@ static const AVOption mov_options[] = {
     { "decryption_keys", "The media decryption keys by KID (hex)", OFFSET(decryption_keys), AV_OPT_TYPE_DICT, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "decryption_video_key", "The media decryption video key (hex)", OFFSET(decryption_video_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "decryption_audio_key", "The media decryption audio key (hex)", OFFSET(decryption_audio_key), AV_OPT_TYPE_BINARY, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "decryption_key_url", "URL that is opened for the key of a KID decryption_keys does not have; {kid}, {type} and {pssh} are filled in",
+        OFFSET(decryption_key_url), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "decryption_pssh", "pssh boxes from the manifest for {pssh} of decryption_key_url (base64, comma separated)",
+        OFFSET(decryption_pssh), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "enable_drefs", "Enable external track support.", OFFSET(enable_drefs), AV_OPT_TYPE_BOOL,
         {.i64 = 0}, 0, 1, FLAGS },
     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
