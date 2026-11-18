@@ -1,6 +1,7 @@
-"""Loopback tests for DASH recovery/startup/ranges and HLS discontinuities."""
+"""Loopback tests for DASH recovery/startup/ranges, HLS discontinuities and CENC key requests."""
 
 import argparse
+import base64
 from collections import Counter
 import http.server
 from pathlib import Path
@@ -10,7 +11,270 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import parse_qs, urlsplit
 import xml.etree.ElementTree as ET
+
+
+def ffmpeg_run(*arguments):
+    """ffmpeg that may fail: (return code, stdout, stderr)."""
+    result = subprocess.run(arguments, capture_output=True, timeout=60)
+    return result.returncode, result.stdout.decode(), result.stderr.decode(errors="replace")
+
+
+def crc_streams(output):
+    """framecrc output -> {stream: [(size, crc), ...]}"""
+    streams = {}
+    for line in output.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        fields = [field.strip() for field in line.split(",")]
+        streams.setdefault(int(fields[0]), []).append((int(fields[4]), fields[5]))
+    return streams
+
+
+def pssh_boxes(data):
+    """whole pssh boxes -> [(system id hex, KIDs hex or None, data)]"""
+    boxes, pos = [], 0
+    while pos + 8 <= len(data):
+        size = int.from_bytes(data[pos:pos + 4], "big")
+        assert data[pos + 4:pos + 8] == b"pssh" and size >= 32, data
+        box = data[pos:pos + size]
+        version, kids, at = box[8], None, 28
+        if version:
+            count = int.from_bytes(box[28:32], "big")
+            kids = [box[32 + 16 * i:48 + 16 * i].hex() for i in range(count)]
+            at = 32 + 16 * count
+        length = int.from_bytes(box[at:at + 4], "big")
+        boxes.append((box[12:28].hex(), kids, box[at + 4:at + 4 + length]))
+        pos += size
+    assert pos == len(data), data
+    return boxes
+
+
+def pssh_box(system, payload, kids=None):
+    body = (b"\x01\x00\x00\x00" if kids else b"\x00\x00\x00\x00") + bytes.fromhex(system)
+    if kids:
+        body += len(kids).to_bytes(4, "big") + b"".join(bytes.fromhex(kid) for kid in kids)
+    body += len(payload).to_bytes(4, "big") + payload
+    return (len(body) + 8).to_bytes(4, "big") + b"pssh" + body
+
+
+def check_cenc_key_request(ffmpeg, top):
+    """decryption_key_url (mov) and cenc_decryption_key_url (DASH, HLS): the
+    key of every KID is requested once, through the outer context."""
+    root = top / "cenc"
+    root.mkdir()
+    widevine = "edef8ba979d64acea3c827dcd51d21ed"
+    playready = "9a04f07998404286ab92e65be0885f95"
+    kid_a, key_a = "00112233445566778899aabbccddeeff", "0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    kid_b, key_b = "ffeeddccbbaa99887766554433221100", "a0b1c2d3e4f5061728394a5b6c7d8e9f"
+    kid_t = "1234567890abcdef1234567890abcdef"  # the second track of the MP4
+    pcm = root / "input.pcm"
+    pcm.write_bytes(bytes((i * 7919 + (i >> 9) * 31) & 0xFF for i in range(48000 * 4 * 3)))
+    clear = {}
+    for name, rate in (("a", "64k"), ("b", "96k")):
+        clear[name] = root / f"clear-{name}.mp4"
+        run(ffmpeg, "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", str(pcm),
+            "-c:a", "aac", "-b:a", rate, str(clear[name]))
+    reference = {name: crc_streams(run(ffmpeg, "-i", str(path), "-c", "copy", "-f", "framecrc", "-"))[0]
+                 for name, path in clear.items()}
+
+    # one DASH representation (and HLS playlist) per key: the dash muxer
+    # encrypts all its representations with the same key
+    ns = {"d": "urn:mpeg:dash:schema:mpd:2011", "cenc": "urn:mpeg:cenc:2013"}
+    ET.register_namespace("", ns["d"])
+    ET.register_namespace("cenc", ns["cenc"])
+    representations = []
+    for name, source, kid, key in (("a", "a", kid_a, key_a), ("b", "b", kid_b, key_b),
+                                   ("c", "b", kid_a, key_a)):
+        directory = root / name
+        directory.mkdir()
+        run(ffmpeg, "-y", "-i", str(clear[source]), "-c", "copy", "-f", "dash",
+            "-seg_duration", "1", "-use_template", "1", "-use_timeline", "1",
+            "-init_seg_name", "init.m4s", "-media_seg_name", "seg-$Number%05d$.m4s",
+            "-format_options", f"encryption_scheme=cenc-aes-ctr:encryption_key={key}:encryption_kid={kid}",
+            "-hls_playlist", "1", str(directory / "stream.mpd"))
+        mpd = ET.parse(directory / "stream.mpd").getroot()
+        adaptation = mpd.find(".//d:AdaptationSet", ns)
+        representation = adaptation.find("d:Representation", ns)
+        template = representation.find("d:SegmentTemplate", ns)
+        if template is None:
+            template = adaptation.find("d:SegmentTemplate", ns)
+            representation.append(template)
+        template.set("initialization", f"{name}/" + template.get("initialization"))
+        template.set("media", f"{name}/" + template.get("media"))
+        representation.set("id", name)
+        representations.append((mpd, adaptation, representation))
+    mpd, adaptation, _ = representations[0]
+    for child in list(adaptation):
+        if child.tag != f"{{{ns['d']}}}Representation":
+            adaptation.remove(child)
+    wv_box = pssh_box(widevine, b"ep3 test, any KID")
+    pr_box = pssh_box(playready, b"ep3 test, only B", [kid_b])
+    protection = ET.Element(f"{{{ns['d']}}}ContentProtection",
+                            schemeIdUri=f"urn:uuid:{widevine}")
+    ET.SubElement(protection, f"{{{ns['cenc']}}}pssh").text = "\n  " + base64.b64encode(wv_box).decode() + "\n"
+    adaptation.insert(0, protection)
+    for _, _, representation in representations[1:]:
+        adaptation.append(representation)
+    protection = ET.Element(f"{{{ns['d']}}}ContentProtection",
+                            schemeIdUri=f"urn:uuid:{playready}")
+    ET.SubElement(protection, f"{{{ns['cenc']}}}pssh").text = base64.b64encode(pr_box).decode()
+    representations[1][2].insert(0, protection)
+    (root / "keys.mpd").write_bytes(ET.tostring(mpd))
+
+    # MP4 with two tracks: encrypted with one key, the KID of the second
+    # track changed afterwards, so that each track has its own KID. Read
+    # over http: the protocol whitelist of a local file ("file,crypto,data")
+    # would not let the key request out.
+    two = root / "two.mp4"
+    run(ffmpeg, "-y", "-i", str(clear["a"]), "-i", str(clear["b"]), "-map", "0", "-map", "1",
+        "-c", "copy", "-encryption_scheme", "cenc-aes-ctr", "-encryption_key", key_a,
+        "-encryption_kid", kid_a, str(two))
+    data = bytearray(two.read_bytes())
+    tenc = [m.start() for m in re.finditer(b"tenc", data)]
+    assert len(tenc) == 2, tenc
+    assert data[tenc[1] + 12:tenc[1] + 28] == bytes.fromhex(kid_a)
+    data[tenc[1] + 12:tenc[1] + 28] = bytes.fromhex(kid_t)
+    two.write_bytes(bytes(data))
+
+    answers = {}
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            url = urlsplit(self.path)
+            status, payload = 200, b""
+            if url.path == "/key":
+                query = parse_qs(url.query, keep_blank_values=True)
+                kid = query["kid"][0]
+                pssh = base64.b64decode(query["pssh"][0]) if query.get("pssh", [""])[0] else b""
+                requests.append((kid, query.get("type", [None])[0], pssh))
+                if kid in answers:
+                    payload = answers[kid]
+                else:
+                    status = 404
+            else:
+                file = root / url.path.lstrip("/")
+                if file.is_file():
+                    payload = file.read_bytes()
+                else:
+                    status = 404
+            match = re.fullmatch(r"bytes=(\d+)-(\d*)", self.headers.get("Range") or "")
+            if status == 200 and match:
+                total = len(payload)
+                start = int(match[1])
+                end = min(int(match[2]) if match[2] else total - 1, total - 1)
+                payload, status = payload[start:end + 1], 206
+            self.send_response(status)
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{total}")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            try:
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+        def log_message(self, *_):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    key_url = base + "/key?kid={kid}&type={type}&pssh={pssh}"
+
+    def read(*options):
+        requests.clear()
+        code, output, log = ffmpeg_run(ffmpeg, "-hide_banner", *options, "-map", "0",
+                                       "-c", "copy", "-f", "framecrc", "-")
+        return code, crc_streams(output), log
+
+    def decrypted(packets, name):
+        """all packets are clear packets of that source, at most two missing"""
+        return set(packets) <= set(reference[name]) and len(packets) >= len(reference[name]) - 2
+
+    try:
+        # without a key the packets stay encrypted (the test media is encrypted)
+        _, streams, log = read("-i", base + "/keys.mpd")
+        assert len(streams) == 3 and not requests, (streams.keys(), requests, log)
+        assert all(len(set(packets) & set(reference["a"] + reference["b"])) < 3
+                   for packets in streams.values()), log
+
+        # DASH: three representations, two KIDs; the key of A as hex, the
+        # one of B as 16 bytes
+        answers.update({kid_a: (" " + key_a.upper() + "\r\n").encode(), kid_b: bytes.fromhex(key_b)})
+        code, streams, log = read("-cenc_decryption_key_url", key_url, "-i", base + "/keys.mpd")
+        assert code == 0, log
+        assert len(streams) == 3, (streams.keys(), log)
+        assert decrypted(streams[0], "a") and decrypted(streams[1], "b") and decrypted(streams[2], "b"), log
+        assert sorted(kid for kid, _, _ in requests) == sorted([kid_a, kid_b]), requests
+        for kid, kind, pssh in requests:
+            assert kind == "audio", requests
+            boxes = pssh_boxes(pssh)
+            if kid == kid_a:
+                assert boxes == [(widevine, None, b"ep3 test, any KID")], boxes
+            else:
+                assert boxes == [(widevine, None, b"ep3 test, any KID"),
+                                 (playready, [kid_b], b"ep3 test, only B")], boxes
+        print("PASS CENC key request, DASH: one request per KID for three representations, "
+              "hex and binary answers, MPD pssh boxes per KID")
+
+        # a KID without a key: one request, a clear error; its packets come
+        # encrypted with their encryption info, the other streams play on
+        for answer, message in ((None, f"No key for KID {kid_b}: "),
+                                (b"not a key", f"No key for KID {kid_b}: the answer (9 bytes) is not a key")):
+            answers.pop(kid_b, None)
+            if answer:
+                answers[kid_b] = answer
+            requests.clear()
+            code, output, log = ffmpeg_run(ffmpeg, "-hide_banner", "-cenc_decryption_key_url", key_url,
+                                           "-i", base + "/keys.mpd", "-map", "0", "-c", "copy",
+                                           "-f", "framecrc", "-")
+            streams = crc_streams(output)
+            assert code == 0, log
+            assert message in log, log
+            assert log.count("No key for KID") == 1, log
+            assert [kid for kid, _, _ in requests].count(kid_b) == 1, requests
+            assert [kid for kid, _, _ in requests].count(kid_a) <= 1, requests
+            assert decrypted(streams[0], "a") and len(streams[1]) >= len(reference["b"]) - 2, log
+            assert set(streams[1]).isdisjoint(reference["b"]), "stream without a key decrypted?"
+            lines = [line for line in output.splitlines() if line.startswith("1,")]
+            assert lines and all("Encryption info" in line for line in lines), lines[:3]
+        answers[kid_b] = key_b.encode()
+        print("PASS CENC key request, DASH: a KID without a key (404, not a key) is requested once, "
+              "clear error, its packets stay encrypted with their encryption info, the others play")
+
+        # HLS fMP4 in CENC (no EXT-X-KEY, the KID is in the init segment)
+        code, streams, log = read("-cenc_decryption_key_url", key_url, "-i", base + "/b/master.m3u8")
+        assert code == 0, log
+        assert len(streams) == 1 and decrypted(streams[0], "b"), (streams.keys(), log)
+        assert [(kid, kind, pssh) for kid, kind, pssh in requests] == [(kid_b, "audio", b"")], requests
+        print("PASS CENC key request, HLS fMP4: the key of the KID requested once")
+
+        # MP4 with a KID per track; decryption_keys is asked first
+        answers[kid_t] = key_a.encode()
+        code, streams, log = read("-decryption_key_url", key_url, "-i", base + "/two.mp4")
+        assert code == 0, log
+        assert len(streams) == 2, (streams.keys(), log)
+        assert decrypted(streams[0], "a") and decrypted(streams[1], "b"), log
+        assert sorted(kid for kid, _, _ in requests) == sorted([kid_a, kid_t]), requests
+        code, streams, log = read("-decryption_keys", f"{kid_a}={key_a}",
+                                  "-decryption_key_url", key_url, "-i", base + "/two.mp4")
+        assert code == 0 and decrypted(streams[0], "a") and decrypted(streams[1], "b"), log
+        assert [kid for kid, _, _ in requests] == [kid_t], requests
+        answers[kid_t] = key_b.encode()  # a wrong key only breaks its track
+        code, streams, log = read("-decryption_key_url", key_url, "-i", base + "/two.mp4")
+        assert decrypted(streams[0], "a") and not decrypted(streams[1], "b"), log
+        print("PASS CENC key request, MP4: one request per track KID, decryption_keys first, "
+              "the key of a KID only for its track")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
 
 
 def run(*arguments):
@@ -295,6 +559,7 @@ def main():
             server.shutdown()
             server.server_close()
             thread.join()
+        check_cenc_key_request(args.ffmpeg, root)
 
 
 if __name__ == "__main__":
