@@ -279,6 +279,81 @@ def check_cenc_key_request(ffmpeg, top):
         assert [(kid, kind, pssh) for kid, kind, pssh in requests] == [(kid_b, "audio", b"")], requests
         print("PASS CENC key request, HLS fMP4: the key of the KID requested once")
 
+        # HLS with CENC key tags: the init segments have no KID (tenc all
+        # zeros) and no pssh, the KEYID and the data: URIs of the tags are
+        # what the request gets. z1 and z2 are the same source with another
+        # key and the same init segment (no KID, same IV size); the
+        # playlists use the one of z1 for both.
+        for name, key in (("z1", key_a), ("z2", key_b)):
+            directory = root / name
+            directory.mkdir()
+            run(ffmpeg, "-y", "-i", str(clear["b"]), "-c", "copy", "-f", "dash",
+                "-seg_duration", "1", "-use_template", "1", "-use_timeline", "1",
+                "-init_seg_name", "init.m4s", "-media_seg_name", "seg-$Number%05d$.m4s",
+                "-format_options", f"encryption_scheme=cenc-aes-ctr:encryption_key={key}:"
+                f"encryption_kid={'0' * 32}", "-hls_playlist", "1", str(directory / "stream.mpd"))
+        segments, duration = [], None
+        for line in (root / "z1" / "media_0.m3u8").read_text().splitlines():
+            if line.startswith("#EXTINF:"):
+                duration = line
+            elif line and not line.startswith("#"):
+                segments.append((duration, line))
+        assert len(segments) >= 3, segments
+        kid_1, kid_2 = "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1", "c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2c2"
+        wv_1, wv_2 = pssh_box(widevine, b"ep3 hls, key 1"), pssh_box(widevine, b"ep3 hls, key 2")
+        pro = "<WRMHEADER/>".encode("utf-16-le")  # a PlayReady object, not a box
+
+        def key_tags(method, kid, box, playready_object=None):
+            tags = [f'#EXT-X-KEY:METHOD={method},KEYFORMAT="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed",'
+                    f'KEYFORMATVERSIONS="1",KEYID=0x{kid.upper()},'
+                    f'URI="data:text/plain;base64,{base64.b64encode(box).decode()}"']
+            if playready_object:
+                tags.append(f'#EXT-X-KEY:METHOD={method},KEYFORMAT="com.microsoft.playready",'
+                            f'KEYFORMATVERSIONS="1",KEYID=0x{kid},URI="data:text/plain;charset=UTF-16;'
+                            f'base64,{base64.b64encode(playready_object).decode()}"')
+            # FairPlay next to them: not a key the hls demuxer could load
+            tags.append('#EXT-X-KEY:METHOD=SAMPLE-AES,KEYFORMAT="com.apple.streamingkeydelivery",'
+                        'KEYFORMATVERSIONS="1",URI="skd://ep3-test"')
+            return tags
+
+        def playlist(name, parts):
+            """parts: (first segment index, directory, key tags)"""
+            lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:2",
+                     "#EXT-X-PLAYLIST-TYPE:VOD", '#EXT-X-MAP:URI="z1/init.m4s"']
+            for index, (extinf, uri) in enumerate(segments):
+                for first, directory, tags in parts:
+                    if index == first:
+                        lines += tags
+                current = [directory for first, directory, _ in parts if first <= index][-1]
+                lines += [extinf, f"{current}/{uri}"]
+            (root / name).write_text("\n".join(lines + ["#EXT-X-ENDLIST", ""]))
+
+        playlist("keytags.m3u8", [(0, "z1", key_tags("SAMPLE-AES-CTR", kid_1, wv_1, pro))])
+        half = len(segments) // 2
+        # the same tags repeated in front of every segment of the first key,
+        # the second key named with SAMPLE-AES (cbcs) and a Widevine KEYFORMAT
+        playlist("rotation.m3u8", [(i, "z1", key_tags("SAMPLE-AES-CTR", kid_1, wv_1)) for i in range(half)] +
+                 [(half, "z2", key_tags("SAMPLE-AES", kid_2, wv_2))])
+        answers.update({kid_1: key_a.encode(), kid_2: key_b.encode()})
+
+        code, streams, log = read("-cenc_decryption_key_url", key_url, "-i", base + "/keytags.m3u8")
+        assert code == 0, log
+        assert len(streams) == 1 and decrypted(streams[0], "b"), (streams.keys(), log)
+        assert [(kid, kind) for kid, kind, _ in requests] == [(kid_1, "audio")], requests
+        playready_box = pssh_box(playready, pro)
+        assert pssh_boxes(requests[0][2]) == pssh_boxes(wv_1 + playready_box), requests
+        assert "skd://" not in log and "Unable to open key file" not in log, log
+        print("PASS CENC key request, HLS key tags: KEYID for an init segment without KID, "
+              "Widevine pssh and PlayReady object of the data: URIs, FairPlay tag ignored")
+
+        code, streams, log = read("-cenc_decryption_key_url", key_url, "-i", base + "/rotation.m3u8")
+        assert code == 0, log
+        assert len(streams) == 1 and decrypted(streams[0], "b"), (streams.keys(), log)
+        assert [(kid, kind, pssh_boxes(pssh)) for kid, kind, pssh in requests] == [
+            (kid_1, "audio", pssh_boxes(wv_1)), (kid_2, "audio", pssh_boxes(wv_2))], requests
+        print("PASS CENC key request, HLS key rotation: one request per KEYID with the pssh of its "
+              "tags, the cipher keyed again at the change, SAMPLE-AES with a Widevine KEYFORMAT")
+
         # MP4 with a KID per track; decryption_keys is asked first
         answers[kid_t] = key_a.encode()
         code, streams, log = read("-decryption_key_url", key_url, "-i", base + "/two.mp4")

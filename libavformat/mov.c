@@ -8642,10 +8642,29 @@ static int cenc_request_key(MOVContext *c, MOVStreamContext *sc, const uint8_t *
     return 0;
 }
 
+/**
+ * The KID of a sample. A sample whose KID is all zeros (tenc without a KID)
+ * has the one given with decryption_kid (from the KEYID of the HLS playlist).
+ */
+static const uint8_t *cenc_sample_kid(const MOVContext *c, const AVEncryptionInfo *sample, uint8_t *buf)
+{
+    static const uint8_t zero[16];
+
+    if (sample->key_id_size == 16 && !memcmp(sample->key_id, zero, 16) &&
+        c->decryption_kid && strlen(c->decryption_kid) == 32 &&
+        strspn(c->decryption_kid, "0123456789abcdefABCDEF") == 32) {
+        ff_hex_to_data(buf, c->decryption_kid);
+        return buf;
+    }
+    return sample->key_id;
+}
+
 static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, MOVStreamContext *sc, AVEncryptionInfo *sample) {
     AVDictionaryEntry *key_entry_hex;
     char kid_hex[16*2+1];
     size_t key_entry_len;
+    uint8_t kid_buf[16];
+    const uint8_t *kid;
     int ret;
 
     if (c->decryption_default_key && c->decryption_default_key_len != len) {
@@ -8669,12 +8688,13 @@ static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, MOVStreamConte
         return -1;
     }
 
-    ff_data_to_hex(kid_hex, sample->key_id, 16, 1);
+    kid = cenc_sample_kid(c, sample, kid_buf);
+    ff_data_to_hex(kid_hex, kid, 16, 1);
     key_entry_hex = av_dict_get(c->decryption_keys, kid_hex, NULL, AV_DICT_DONT_STRDUP_KEY|AV_DICT_DONT_STRDUP_VAL);
 
     if (!key_entry_hex && c->decryption_key_url) {
         /* the default key is the answer to a KID that has none */
-        ret = cenc_request_key(c, sc, sample->key_id, out, len);
+        ret = cenc_request_key(c, sc, kid, out, len);
         if (ret != AVERROR(EACCES) || !c->decryption_default_key)
             return ret;
     }
@@ -9007,13 +9027,15 @@ static int cenc_decrypt(MOVContext *c, MOVStreamContext *sc, AVEncryptionInfo *s
      * is decrypted. A sample with another KID (key rotation, a new tenc after
      * a switch of the initialization segment) needs the key of its KID. */
     if (sample->key_id_size == sizeof(sc->cenc.key_id)) {
+        uint8_t kid_buf[16];
+        const uint8_t *kid = cenc_sample_kid(c, sample, kid_buf);
         if ((sc->cenc.aes_ctr || sc->cenc.aes_ctx) &&
-            memcmp(sc->cenc.key_id, sample->key_id, sizeof(sc->cenc.key_id))) {
+            memcmp(sc->cenc.key_id, kid, sizeof(sc->cenc.key_id))) {
             av_aes_ctr_free(sc->cenc.aes_ctr);
             sc->cenc.aes_ctr = NULL;
             av_freep(&sc->cenc.aes_ctx);
         }
-        memcpy(sc->cenc.key_id, sample->key_id, sizeof(sc->cenc.key_id));
+        memcpy(sc->cenc.key_id, kid, sizeof(sc->cenc.key_id));
     }
 
     if (sample->scheme == MKBETAG('c','e','n','c') && !sample->crypt_byte_block && !sample->skip_byte_block) {
@@ -12604,6 +12626,8 @@ static const AVOption mov_options[] = {
         OFFSET(decryption_key_url), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "decryption_pssh", "pssh boxes from the manifest for {pssh} of decryption_key_url (base64, comma separated)",
         OFFSET(decryption_pssh), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_DECODING_PARAM },
+    { "decryption_kid", "KID (hex) of the samples whose KID is all zeros, from the manifest",
+        OFFSET(decryption_kid), AV_OPT_TYPE_STRING, .flags = AV_OPT_FLAG_DECODING_PARAM },
     { "enable_drefs", "Enable external track support.", OFFSET(enable_drefs), AV_OPT_TYPE_BOOL,
         {.i64 = 0}, 0, 1, FLAGS },
     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },

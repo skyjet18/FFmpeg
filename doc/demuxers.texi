@@ -650,7 +650,8 @@ Use HTTP partial requests for downloading HTTP segments.
 Set options for the demuxer of media segments using a list of key=value pairs separated by @code{:}.
 
 fMP4 segments encrypted with ISO Common Encryption (cenc-aes-ctr,
-@code{#EXT-X-KEY:METHOD=SAMPLE-AES-CTR}, e.g. Widevine or PlayReady) are
+@code{#EXT-X-KEY:METHOD=SAMPLE-AES-CTR} or @code{ISO-23001-7}, e.g. Widevine or PlayReady;
+also cbcs, @code{METHOD=SAMPLE-AES} with a Widevine or PlayReady @code{KEYFORMAT}) are
 decrypted by the mov demuxer when the key is passed on here, as
 @code{decryption_key=@var{key}} or, by KID, @code{decryption_keys=@var{kid}=@var{key}}
 (one KID; both in hex). The KEY tag itself is not used for these; without one
@@ -664,6 +665,14 @@ Default value is 0.
 URL template that the mov demuxer of fMP4 segments in CENC opens for the key of a key ID it
 has no key for; see @option{decryption_key_url} of the mov demuxer. The requests go through
 the @code{io_open} callback of this context; every key ID is requested once.
+
+The @code{EXT-X-KEY} tags of these segments are part of the request: the @code{data:} URI of a
+tag whose @code{KEYFORMAT} is a DRM system (@code{urn:uuid:@var{system id}}, e.g. Widevine, or
+@code{com.microsoft.playready}) is a @code{pssh} box in @code{@{pssh@}} (a PlayReady object is
+put into a box of its system), and the @code{KEYID} is the key ID of samples whose @code{tenc}
+box has none (all zeros). The tags in front of a segment apply to its samples, so after a key
+change in the playlist the request for the new key ID has the tags of the new key. A tag of
+another system next to them (FairPlay) is ignored.
 @end table
 
 @section image2
@@ -1029,7 +1038,12 @@ local file only allows @code{file,crypto,data}.
 
 @item decryption_pssh
 @code{pssh} boxes in base64, separated by commas, that are added to @code{@{pssh@}} of
-@option{decryption_key_url}. Set by the DASH demuxer from the manifest.
+@option{decryption_key_url}. Set by the DASH and HLS demuxers from the manifest.
+
+@item decryption_kid
+Key ID, 32 hex digits, of the samples whose key ID is all zeros, for @option{decryption_keys}
+and @option{decryption_key_url}. Set by the HLS demuxer from the @code{KEYID} of the
+@code{EXT-X-KEY} tags.
 
 @item max_stts_delta
 Very high sample deltas written in a trak's stts box may occasionally be intended but usually they are written in
