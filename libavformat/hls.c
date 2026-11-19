@@ -33,12 +33,14 @@
 #include "libavutil/aes.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avassert.h"
+#include "libavutil/base64.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/dict.h"
 #include "libavutil/time.h"
+#include "libavutil/uuid.h"
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
@@ -87,11 +89,21 @@ struct segment {
     char *key;
     enum KeyType key_type;
     uint8_t iv[16];
+    /* index of the CENC key tags in playlist.cenc_key_tags, -1 if none */
+    int cenc_key_tags;
     /* associated Media Initialization Section, treated as a segment */
     struct segment *init_section;
 };
 
 struct rendition;
+
+/* What the CENC key tags in front of a segment carry for the key requests of
+ * the mov demuxer (cenc_decryption_key_url): the pssh boxes of their data:
+ * URIs and the KEYID. */
+struct cenc_key_tags {
+    char *pssh;     /* base64 pssh boxes, comma separated, or NULL */
+    char kid[33];   /* KEYID, 32 lowercase hex digits, or empty */
+};
 
 enum PlaylistType {
     PLS_TYPE_UNSPECIFIED,
@@ -211,6 +223,13 @@ struct playlist {
     char key_fail_url[MAX_URL_SIZE];
     int key_fail_count;
     int key_fail_ret;
+
+    /* The distinct CENC key tag sets of the playlist (only collected with
+     * cenc_decryption_key_url) and the one passed to the segment demuxer,
+     * as index + 1 (0: none). */
+    struct cenc_key_tags **cenc_key_tags;
+    int n_cenc_key_tags;
+    int cenc_key_tags_applied;
 
     /* ID3 timestamp handling (elementary audio streams have ID3 timestamps
      * (and possibly other ID3 tags) in the beginning of each segment) */
@@ -373,6 +392,11 @@ static void free_playlist_list(HLSContext *c)
         struct playlist *pls = c->playlists[i];
         free_segment_list(pls);
         free_init_section_list(pls);
+        for (int j = 0; j < pls->n_cenc_key_tags; j++) {
+            av_freep(&pls->cenc_key_tags[j]->pssh);
+            av_freep(&pls->cenc_key_tags[j]);
+        }
+        av_freep(&pls->cenc_key_tags);
         av_freep(&pls->main_streams);
         av_freep(&pls->associated_streams);
         av_freep(&pls->renditions);
@@ -513,6 +537,8 @@ struct key_info {
      char uri[MAX_URL_SIZE];
      char method[16]; /* the longest: SAMPLE-AES-CTR, ISO-23001-7 */
      char iv[35];
+     char keyformat[64];
+     char keyid[35];
 };
 
 static void handle_key_args(void *context, const char *key,
@@ -528,7 +554,127 @@ static void handle_key_args(void *context, const char *key,
     } else if (!strncmp(key, "IV=", key_len)) {
         *dest     =        info->iv;
         *dest_len = sizeof(info->iv);
+    } else if (!strncmp(key, "KEYFORMAT=", key_len)) {
+        *dest     =        info->keyformat;
+        *dest_len = sizeof(info->keyformat);
+    } else if (!strncmp(key, "KEYID=", key_len)) {
+        *dest     =        info->keyid;
+        *dest_len = sizeof(info->keyid);
     }
+}
+
+/**
+ * The system ID of the DRM system a KEYFORMAT names, if it is one that uses
+ * ISO Common Encryption: urn:uuid:<system ID> (Widevine, PlayReady, ...) or
+ * com.microsoft.playready. Not identity, not FairPlay.
+ */
+static int cenc_keyformat_system_id(const char *keyformat, AVUUID system_id)
+{
+    static const AVUUID playready = {
+        0x9a, 0x04, 0xf0, 0x79, 0x98, 0x40, 0x42, 0x86,
+        0xab, 0x92, 0xe6, 0x5b, 0xe0, 0x88, 0x5f, 0x95
+    };
+
+    if (!av_strcasecmp(keyformat, "com.microsoft.playready")) {
+        av_uuid_copy(system_id, playready);
+        return 1;
+    }
+    return av_strncasecmp(keyformat, "urn:uuid:", 9) ? 0 :
+           !av_uuid_parse(keyformat + 9, system_id);
+}
+
+/**
+ * Add what a CENC key tag carries for the key requests: the KEYID, and the
+ * data: URI as a pssh box. The URI of a Widevine tag is a whole pssh box,
+ * the one of a PlayReady tag the PlayReady object, which is put into a pssh
+ * box of its system. Anything else in the URI (a license server URL) is not
+ * for the key request.
+ */
+static int cenc_key_tag_add(const struct key_info *info, const AVUUID system_id,
+                            char **pssh, char *kid)
+{
+    const char *data = info->uri, *comma;
+    uint8_t *buf, *box;
+    char *b64, *joined;
+    int size, box_size;
+
+    if (!kid[0] && !av_strncasecmp(info->keyid, "0x", 2) && strlen(info->keyid) == 34) {
+        int i;
+        for (i = 2; i < 34 && av_isxdigit(info->keyid[i]); i++)
+            kid[i - 2] = av_tolower(info->keyid[i]);
+        kid[i == 34 ? 32 : 0] = 0;
+    }
+
+    if (av_strncasecmp(data, "data:", 5) || !(comma = strchr(data, ',')) ||
+        comma - data < 12 || av_strncasecmp(comma - 7, ";base64", 7))
+        return 0;
+    data = comma + 1;
+    size = AV_BASE64_DECODE_SIZE(strlen(data));
+    buf = av_malloc(size + 32);
+    if (!buf)
+        return AVERROR(ENOMEM);
+    size = av_base64_decode(buf + 32, data, size);
+    box = buf + 32;
+    box_size = size;
+    if (size <= 0) {
+        av_free(buf);
+        return 0;
+    }
+    if (size < 32 || AV_RB32(box) != size || AV_RL32(box + 4) != MKTAG('p','s','s','h')) {
+        /* the data of the system: a version 0 box around it */
+        box = buf;
+        box_size = size + 32;
+        AV_WB32(box, box_size);
+        AV_WL32(box + 4, MKTAG('p','s','s','h'));
+        AV_WB32(box + 8, 0);
+        memcpy(box + 12, system_id, 16);
+        AV_WB32(box + 28, size);
+    }
+
+    b64 = av_malloc(AV_BASE64_SIZE(box_size));
+    if (!b64) {
+        av_free(buf);
+        return AVERROR(ENOMEM);
+    }
+    av_base64_encode(b64, AV_BASE64_SIZE(box_size), box, box_size);
+    av_free(buf);
+    if (*pssh && strstr(*pssh, b64)) {
+        av_free(b64);
+        return 0;
+    }
+    joined = *pssh ? av_asprintf("%s,%s", *pssh, b64) : av_strdup(b64);
+    av_free(b64);
+    if (!joined)
+        return AVERROR(ENOMEM);
+    av_free(*pssh);
+    *pssh = joined;
+    return 0;
+}
+
+/* The index of the set of CENC key tags in pls->cenc_key_tags, added if new. */
+static int cenc_key_tags_index(struct playlist *pls, const char *pssh, const char *kid)
+{
+    struct cenc_key_tags *tags;
+
+    for (int i = 0; i < pls->n_cenc_key_tags; i++) {
+        tags = pls->cenc_key_tags[i];
+        if (!strcmp(tags->kid, kid) && !strcmp(tags->pssh ? tags->pssh : "", pssh ? pssh : ""))
+            return i;
+    }
+    tags = av_mallocz(sizeof(*tags));
+    if (!tags)
+        return AVERROR(ENOMEM);
+    if (pssh && !(tags->pssh = av_strdup(pssh))) {
+        av_free(tags);
+        return AVERROR(ENOMEM);
+    }
+    av_strlcpy(tags->kid, kid, sizeof(tags->kid));
+    if (av_dynarray_add_nofree(&pls->cenc_key_tags, &pls->n_cenc_key_tags, tags) < 0) {
+        av_free(tags->pssh);
+        av_free(tags);
+        return AVERROR(ENOMEM);
+    }
+    return pls->n_cenc_key_tags - 1;
 }
 
 struct init_section_info {
@@ -1018,6 +1164,11 @@ static int parse_playlist(HLSContext *c, const char *url,
     int discontinuity = 0;
     int discontinuity_sequence_seen = 0;
     int segment_seen = 0;
+    /* The KEY tags since the last segment are one set, one tag per DRM
+     * system. What the CENC tags of the set carry for the key requests: */
+    int key_tags_open = 0, cenc_in_set = 0;
+    char *cenc_pssh = NULL;
+    char cenc_kid[33] = "";
 
     if (is_http && !in && c->http_persistent && c->playlist_pb) {
         in = c->playlist_pb;
@@ -1089,22 +1240,54 @@ static int parse_playlist(HLSContext *c, const char *url,
             ff_parse_key_value(ptr, handle_variant_args, &variant_info);
         } else if (av_strstart(line, "#EXT-X-KEY:", &ptr)) {
             struct key_info info = {{0}};
+            AVUUID system_id = { 0 };
+            int has_system, is_cenc;
             ff_parse_key_value(ptr, handle_key_args, &info);
+            if (!key_tags_open) {
+                av_freep(&cenc_pssh);
+                cenc_kid[0] = 0;
+                cenc_in_set = 0;
+                key_tags_open = 1;
+            }
+            has_system = cenc_keyformat_system_id(info.keyformat, system_id);
+            /* SAMPLE-AES with a Widevine or PlayReady KEYFORMAT is cbcs of
+             * fMP4 segments, which the mov demuxer decrypts as well */
+            is_cenc = !strcmp(info.method, "SAMPLE-AES-CTR") ||
+                      !strcmp(info.method, "ISO-23001-7") ||
+                      (!strcmp(info.method, "SAMPLE-AES") && has_system);
+            /* A tag of another DRM system next to a CENC tag of the same
+             * segments (FairPlay with skd://) does not replace it. */
+            if (!is_cenc && cenc_in_set && info.keyformat[0] &&
+                strcmp(info.keyformat, "identity"))
+                continue;
+            if (!strcmp(info.method, "NONE")) {
+                av_freep(&cenc_pssh);
+                cenc_kid[0] = 0;
+                cenc_in_set = 0;
+            }
             key_type = KEY_NONE;
             has_iv = 0;
             if (!strcmp(info.method, "AES-128"))
                 key_type = KEY_AES_128;
-            if (!strcmp(info.method, "SAMPLE-AES"))
+            if (!strcmp(info.method, "SAMPLE-AES") && !is_cenc)
                 key_type = KEY_SAMPLE_AES;
-            if (!strcmp(info.method, "SAMPLE-AES-CTR") ||
-                !strcmp(info.method, "ISO-23001-7")) {
+            if (is_cenc) {
                 /* ISO Common Encryption (cenc) of fMP4 segments: the KEY
                  * tag names a DRM system, there is no key to load here. The
                  * mov demuxer of the segments decrypts them with the key
-                 * passed in seg_format_options. */
+                 * passed in seg_format_options, or requests it with
+                 * cenc_decryption_key_url, which gets the pssh boxes and
+                 * the KEYID of the tags. */
+                cenc_in_set = 1;
+                if (c->cenc_decryption_key_url && *c->cenc_decryption_key_url) {
+                    ret = cenc_key_tag_add(&info, system_id, &cenc_pssh, cenc_kid);
+                    if (ret < 0)
+                        goto fail;
+                }
                 if (!c->cenc_logged) {
                     int has_key = av_dict_get(c->seg_format_opts, "decryption_key", NULL, 0) ||
-                                  av_dict_get(c->seg_format_opts, "decryption_keys", NULL, 0);
+                                  av_dict_get(c->seg_format_opts, "decryption_keys", NULL, 0) ||
+                                  (c->cenc_decryption_key_url && *c->cenc_decryption_key_url);
                     av_log(c->ctx, has_key ? AV_LOG_VERBOSE : AV_LOG_WARNING,
                            "Segments are encrypted with %s (CENC)%s\n", info.method,
                            has_key ? "" : ", no decryption_key or decryption_keys in seg_format_options");
@@ -1274,14 +1457,24 @@ static int parse_playlist(HLSContext *c, const char *url,
             }
             if (is_segment) {
                 struct segment *seg;
+                int cenc_tags = -1;
                 ret = ensure_playlist(c, &pls, url);
                 if (ret < 0)
                     goto fail;
+                key_tags_open = 0;
+                if (cenc_pssh || cenc_kid[0]) {
+                    cenc_tags = cenc_key_tags_index(pls, cenc_pssh, cenc_kid);
+                    if (cenc_tags < 0) {
+                        ret = cenc_tags;
+                        goto fail;
+                    }
+                }
                 seg = av_malloc(sizeof(struct segment));
                 if (!seg) {
                     ret = AVERROR(ENOMEM);
                     goto fail;
                 }
+                seg->cenc_key_tags = cenc_tags;
                 if (has_iv) {
                     memcpy(seg->iv, iv, sizeof(iv));
                 } else {
@@ -1388,6 +1581,7 @@ static int parse_playlist(HLSContext *c, const char *url,
 
 fail:
     av_free(new_url);
+    av_free(cenc_pssh);
     if (close_in)
         ff_format_io_close(c->ctx, &in);
     c->ctx->ctx_flags = c->ctx->ctx_flags & ~(unsigned)AVFMTCTX_UNSEEKABLE;
@@ -2047,6 +2241,31 @@ cleanup:
     return ret;
 }
 
+/**
+ * Pass the pssh boxes and the KEYID of the CENC key tags of seg to the mov
+ * demuxer of the playlist (decryption_pssh, decryption_kid) when they differ
+ * from the ones it has, so that a key it requests for the samples of seg
+ * gets the ones of seg (key rotation in the playlist). The segment is
+ * opened before the demuxer reads a sample of it.
+ */
+static void cenc_key_tags_apply(HLSContext *c, struct playlist *pls, const struct segment *seg)
+{
+    const struct cenc_key_tags *tags;
+    int idx;
+
+    if (!seg || !c->cenc_decryption_key_url || !*c->cenc_decryption_key_url ||
+        !pls->ctx || !pls->ctx->iformat || !pls->ctx->priv_data ||
+        !strstr(pls->ctx->iformat->name, "mov"))
+        return;
+    idx = seg->cenc_key_tags + 1;
+    if (idx == pls->cenc_key_tags_applied)
+        return;
+    tags = idx ? pls->cenc_key_tags[idx - 1] : NULL;
+    av_opt_set(pls->ctx->priv_data, "decryption_pssh", tags && tags->pssh ? tags->pssh : "", 0);
+    av_opt_set(pls->ctx->priv_data, "decryption_kid", tags ? tags->kid : "", 0);
+    pls->cenc_key_tags_applied = idx;
+}
+
 static int update_init_section(struct playlist *pls, struct segment *seg)
 {
     static const int max_init_section_size = 1024*1024;
@@ -2324,6 +2543,8 @@ restart:
         ret = update_init_section(v, seg);
         if (ret)
             return ret;
+
+        cenc_key_tags_apply(c, v, seg);
 
         if (c->http_multiple == 1 && v->input_next_requested) {
             FFSWAP(AVIOContext *, v->input, v->input_next);
@@ -3401,8 +3622,19 @@ static int hls_read_header(AVFormatContext *s)
             return ret;
 
         av_dict_copy(&options, c->seg_format_opts, 0);
-        if (c->cenc_decryption_key_url && *c->cenc_decryption_key_url && strstr(in_fmt->name, "mov"))
+        if (c->cenc_decryption_key_url && *c->cenc_decryption_key_url && strstr(in_fmt->name, "mov")) {
+            /* the key tags of the segment the demuxer reads first */
+            const struct segment *first = current_segment(pls);
             av_dict_set(&options, "decryption_key_url", c->cenc_decryption_key_url, 0);
+            if (first && first->cenc_key_tags >= 0) {
+                const struct cenc_key_tags *tags = pls->cenc_key_tags[first->cenc_key_tags];
+                if (tags->pssh)
+                    av_dict_set(&options, "decryption_pssh", tags->pssh, 0);
+                if (tags->kid[0])
+                    av_dict_set(&options, "decryption_kid", tags->kid, 0);
+                pls->cenc_key_tags_applied = first->cenc_key_tags + 1;
+            }
+        }
 
         ret = avformat_open_input(&pls->ctx, pls->segments[0]->url, in_fmt, &options);
         av_dict_free(&options);

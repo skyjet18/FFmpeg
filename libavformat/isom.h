@@ -397,6 +397,7 @@ typedef struct MOVContext {
     AVDictionary* decryption_keys;
     char *decryption_key_url;
     char *decryption_pssh;
+    char *decryption_kid;
     unsigned heif_icc_profile_items;
 } MOVContext;
 
