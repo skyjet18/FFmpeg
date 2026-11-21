@@ -292,6 +292,14 @@ Default 16-byte key, in hex, to decrypt files encrypted using ISO Common Encrypt
 Dictionary of 16-byte key ID => 16-byte key, both in hex, to decrypt files encrypted using ISO Common Encryption
 (CENC/AES-128 CTR; ISO/IEC 23001-7).
 
+@item cenc_decryption_key_url
+URL template that the demuxers of the representations open for the key of a key ID
+that @option{cenc_decryption_keys} does not have; see @option{decryption_key_url} of
+the mov demuxer. The requests go through the @code{io_open} callback of this
+context; every key ID is requested once for the whole stream. The @code{cenc:pssh}
+boxes of the @code{ContentProtection} elements of the AdaptationSet and the
+Representation are part of @code{@{pssh@}}.
+
 @item dash_subtitle_default_discard
 Initially discard all manifest subtitle representations, including unprobed
 streams. Disabled by default. Interactive players can enable this before
@@ -651,6 +659,11 @@ of the options a warning is logged and the packets stay encrypted.
 @item seg_max_retry
 Maximum number of times to reload a segment on error, useful when segment skip on network error is not desired.
 Default value is 0.
+
+@item cenc_decryption_key_url
+URL template that the mov demuxer of fMP4 segments in CENC opens for the key of a key ID it
+has no key for; see @option{decryption_key_url} of the mov demuxer. The requests go through
+the @code{io_open} callback of this context; every key ID is requested once.
 @end table
 
 @section image2
@@ -999,6 +1012,24 @@ Default 16-byte key, in hex, to decrypt files encrypted using ISO Common Encrypt
 @item decryption_keys
 Dictionary of 16-byte key ID => 16-byte key, both in hex, to decrypt files encrypted using ISO Common Encryption
 (CENC/AES-128 CTR; ISO/IEC 23001-7).
+
+@item decryption_key_url
+URL template that is opened for the key of a key ID that @option{decryption_keys} does not have.
+@code{@{kid@}} is replaced by the key ID (32 lowercase hex digits), @code{@{type@}} by the type of the
+track (@code{video}, @code{audio}, @code{subtitle}, @code{data}) and @code{@{pssh@}} by the base64 of the
+@code{pssh} boxes that apply to the key ID (whole boxes one after the other, @code{+}, @code{/} and
+@code{=} percent-escaped). The answer is the key: 16 bytes, or 32 hex digits.
+Every key ID is requested once; without a key the packets of that key ID fail
+(with @option{decryption_key} set, it is used instead).
+
+The URL is opened with the @code{io_open} callback of the outermost format context, so an
+application can answer the request itself. For a demuxer opened by the DASH or HLS demuxer
+that is the one of the DASH or HLS context. The protocol whitelist of that context applies: a
+local file only allows @code{file,crypto,data}.
+
+@item decryption_pssh
+@code{pssh} boxes in base64, separated by commas, that are added to @code{@{pssh@}} of
+@option{decryption_key_url}. Set by the DASH demuxer from the manifest.
 
 @item max_stts_delta
 Very high sample deltas written in a trak's stts box may occasionally be intended but usually they are written in

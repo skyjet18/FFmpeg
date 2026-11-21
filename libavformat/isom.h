@@ -284,6 +284,7 @@ typedef struct MOVStreamContext {
         unsigned int per_sample_iv_size;  // Either 0, 8, or 16.
         AVEncryptionInfo *default_encrypted_sample;
         MOVEncryptionIndex *encryption_index;
+        uint8_t key_id[16];  // KID of the key aes_ctr or aes_ctx was set up with
     } cenc;
 
     struct IAMFDemuxContext *iamf;
@@ -394,6 +395,8 @@ typedef struct MOVContext {
     int64_t idat_offset;
     int interleaved_read;
     AVDictionary* decryption_keys;
+    char *decryption_key_url;
+    char *decryption_pssh;
     unsigned heif_icc_profile_items;
 } MOVContext;
 

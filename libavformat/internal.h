@@ -118,6 +118,19 @@ typedef struct FFFormatContext {
     AVDictionary *id3v2_meta;
 
     int missing_streams;
+
+    /**
+     * For a demuxer that another demuxer opened (DASH representation, HLS
+     * playlist): the context of that demuxer. CENC key requests of the mov
+     * demuxer (decryption_key_url) go through io_open of the outermost one.
+     */
+    struct AVFormatContext *cenc_key_parent;
+
+    /**
+     * The answers to the CENC key requests of this context and the demuxers
+     * it opened: KID (hex) -> key (hex), an empty value for "no key".
+     */
+    AVDictionary *cenc_keys;
 } FFFormatContext;
 
 static av_always_inline FFFormatContext *ffformatcontext(AVFormatContext *s)
