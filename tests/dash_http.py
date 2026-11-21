@@ -152,10 +152,13 @@ def check_cenc_key_request(ffmpeg, top):
                 kid = query["kid"][0]
                 pssh = base64.b64decode(query["pssh"][0]) if query.get("pssh", [""])[0] else b""
                 requests.append((kid, query.get("type", [None])[0], pssh))
-                if kid in answers:
-                    payload = answers[kid]
+                answer = answers.get(kid, 404)
+                if isinstance(answer, list):  # one answer per request, the last one stays
+                    answer = answer.pop(0) if len(answer) > 1 else answer[0]
+                if isinstance(answer, int):
+                    status = answer
                 else:
-                    status = 404
+                    payload = answer
             else:
                 file = root / url.path.lstrip("/")
                 if file.is_file():
@@ -223,13 +226,14 @@ def check_cenc_key_request(ffmpeg, top):
         print("PASS CENC key request, DASH: one request per KID for three representations, "
               "hex and binary answers, MPD pssh boxes per KID")
 
-        # a KID without a key: one request, a clear error; its packets come
-        # encrypted with their encryption info, the other streams play on
-        for answer, message in ((None, f"No key for KID {kid_b}: "),
-                                (b"not a key", f"No key for KID {kid_b}: the answer (9 bytes) is not a key")):
-            answers.pop(kid_b, None)
-            if answer:
-                answers[kid_b] = answer
+        # a KID without a key: a clear error; its packets come encrypted with
+        # their encryption info, the other streams play on. A refused request
+        # or an answer that is not a key is final (one request); a 404 is
+        # asked again after 2 s (the read takes less, but leave room)
+        for answer, message, most in ((404, f"No key for KID {kid_b} yet: ", 2),
+                                      (403, f"No key for KID {kid_b}: ", 1),
+                                      (b"not a key", f"No key for KID {kid_b}: the answer (9 bytes) is not a key", 1)):
+            answers[kid_b] = answer
             requests.clear()
             code, output, log = ffmpeg_run(ffmpeg, "-hide_banner", "-cenc_decryption_key_url", key_url,
                                            "-i", base + "/keys.mpd", "-map", "0", "-c", "copy",
@@ -237,16 +241,36 @@ def check_cenc_key_request(ffmpeg, top):
             streams = crc_streams(output)
             assert code == 0, log
             assert message in log, log
-            assert log.count("No key for KID") == 1, log
-            assert [kid for kid, _, _ in requests].count(kid_b) == 1, requests
+            assert 1 <= log.count("No key for KID") <= most, log
+            assert 1 <= [kid for kid, _, _ in requests].count(kid_b) <= most, requests
             assert [kid for kid, _, _ in requests].count(kid_a) <= 1, requests
             assert decrypted(streams[0], "a") and len(streams[1]) >= len(reference["b"]) - 2, log
             assert set(streams[1]).isdisjoint(reference["b"]), "stream without a key decrypted?"
             lines = [line for line in output.splitlines() if line.startswith("1,")]
             assert lines and all("Encryption info" in line for line in lines), lines[:3]
         answers[kid_b] = key_b.encode()
-        print("PASS CENC key request, DASH: a KID without a key (404, not a key) is requested once, "
-              "clear error, its packets stay encrypted with their encryption info, the others play")
+        print("PASS CENC key request, DASH: a KID without a key (404, 403, not a key): clear error, "
+              "its packets stay encrypted with their encryption info, the others play")
+
+        # a key service that fails for a while (503): the failure is not
+        # kept, the KID is asked again after 2 s and the rest of the stream
+        # is decrypted. Read in real time, the media is 3 s long.
+        answers[kid_b] = [503, key_b.encode()]
+        requests.clear()
+        code, output, log = ffmpeg_run(ffmpeg, "-hide_banner", "-readrate", "1",
+                                       "-readrate_initial_burst", "0",
+                                       "-cenc_decryption_key_url", key_url,
+                                       "-i", base + "/b/master.m3u8", "-map", "0", "-c", "copy",
+                                       "-f", "framecrc", "-")
+        packets = crc_streams(output).get(0, [])
+        assert code == 0, log
+        assert [kid for kid, _, _ in requests] == [kid_b, kid_b], (requests, log)
+        assert f"No key for KID {kid_b} yet: " in log and "asking again in 2 s" in log, log
+        assert packets and packets[0] not in reference["b"], "decrypted before the key?"
+        assert set(packets[-10:]) <= set(reference["b"]), "not decrypted after the retry"
+        answers[kid_b] = key_b.encode()
+        print("PASS CENC key request, HLS fMP4: a 503 is not kept, the KID is asked again after 2 s "
+              "and the rest of the stream is decrypted")
 
         # HLS fMP4 in CENC (no EXT-X-KEY, the KID is in the init segment)
         code, streams, log = read("-cenc_decryption_key_url", key_url, "-i", base + "/b/master.m3u8")
