@@ -1695,7 +1695,8 @@ static struct segment *next_segment(struct playlist *pls)
 /* True if 'next' is an unencrypted byte range that directly follows 'cur' in
  * the same resource and ends within the range requested up to 'end', so that
  * it is read on from the input of 'cur' (i.e. consecutive EXT-X-BYTERANGE
- * segments). */
+ * segments). A segment with other CENC key tags is opened on its own, so
+ * that cenc_key_tags_apply() passes its tags before it is read. */
 static int segment_continues(const struct segment *cur,
                              const struct segment *next, int64_t end)
 {
@@ -1705,6 +1706,7 @@ static int segment_continues(const struct segment *cur,
            next->url_offset + next->size <= end &&
            cur->key_type == KEY_NONE && next->key_type == KEY_NONE &&
            next->init_section == cur->init_section &&
+           next->cenc_key_tags == cur->cenc_key_tags &&
            !next->discontinuity &&
            !strcmp(next->url, cur->url);
 }

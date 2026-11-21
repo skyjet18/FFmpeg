@@ -354,6 +354,33 @@ def check_cenc_key_request(ffmpeg, top):
         print("PASS CENC key request, HLS key rotation: one request per KEYID with the pssh of its "
               "tags, the cipher keyed again at the change, SAMPLE-AES with a Widevine KEYFORMAT")
 
+        # the same rotation with all segments as EXT-X-BYTERANGE parts of one
+        # file: consecutive parts are read with one request, the part where
+        # the key tags change must start a new one so that its KEYID applies
+        data, ranges = b"", []
+        for index, (extinf, uri) in enumerate(segments):
+            part = (root / ("z1" if index < half else "z2") / uri).read_bytes()
+            ranges.append((extinf, len(part), len(data)))
+            data += part
+        (root / "parts.m4s").write_bytes(data)
+        lines = ["#EXTM3U", "#EXT-X-VERSION:6", "#EXT-X-TARGETDURATION:2",
+                 "#EXT-X-PLAYLIST-TYPE:VOD", '#EXT-X-MAP:URI="z1/init.m4s"']
+        for index, (extinf, size, offset) in enumerate(ranges):
+            if index < half:
+                lines += key_tags("SAMPLE-AES-CTR", kid_1, wv_1)
+            elif index == half:
+                lines += key_tags("SAMPLE-AES", kid_2, wv_2)
+            lines += [extinf, f"#EXT-X-BYTERANGE:{size}@{offset}", "parts.m4s"]
+        (root / "parts.m3u8").write_text("\n".join(lines + ["#EXT-X-ENDLIST", ""]))
+        code, streams, log = read("-cenc_decryption_key_url", key_url, "-i", base + "/parts.m3u8")
+        assert code == 0, log
+        # before: one request for all parts, the second key never asked for
+        assert [(kid, kind, pssh_boxes(pssh)) for kid, kind, pssh in requests] == [
+            (kid_1, "audio", pssh_boxes(wv_1)), (kid_2, "audio", pssh_boxes(wv_2))], requests
+        assert len(streams) == 1 and decrypted(streams[0], "b"), (streams.keys(), log)
+        print("PASS CENC key request, HLS key rotation in BYTERANGE parts of one file: "
+              "the KEYID of the second part set reaches the key request")
+
         # MP4 with a KID per track; decryption_keys is asked first
         answers[kid_t] = key_a.encode()
         code, streams, log = read("-decryption_key_url", key_url, "-i", base + "/two.mp4")
