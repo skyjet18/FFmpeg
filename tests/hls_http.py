@@ -277,6 +277,61 @@ def check_dead_key(ffmpeg):
             thread.join()
 
 
+def check_key_scheme(ffmpeg):
+    """key:// gives the AES-128 key as 32 hex digits. Another length or a
+    digit that is not hex fails the segments without reading them, before:
+    the segments were decrypted with the key of before (zeros) and handed
+    to the demuxer as garbage."""
+    key = bytes(range(16))
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-key-scheme-") as directory:
+        root = Path(directory)
+        (root / "video.raw").write_bytes(bytes([96]) * (64 * 64 * 3 // 2 * 25 * 4))
+        (root / "aes.key").write_bytes(key)
+        (root / "keyinfo").write_text(f"aes.key\n{root / 'aes.key'}\n", encoding="ascii")
+        run(ffmpeg, "-y", "-f", "rawvideo", "-pixel_format", "yuv420p", "-video_size", "64x64",
+            "-framerate", "25", "-i", str(root / "video.raw"),
+            "-c:v", "mpeg2video", "-g", "25", "-bf", "0",
+            "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
+            "-hls_key_info_file", str(root / "keyinfo"),
+            "-hls_segment_filename", str(root / "aes-%03d.ts"), str(root / "aes.m3u8"))
+        playlist = (root / "aes.m3u8").read_text()
+        assert 'URI="aes.key"' in playlist, playlist
+        segments = {file.name for file in root.glob("aes-*.ts")}
+        cases = (("good", key.hex(), True),
+                 ("short", key.hex()[:30], False),
+                 ("nonhex", key.hex()[:30] + "zz", False))
+        for name, digits, _ in cases:
+            (root / f"{name}.m3u8").write_text(
+                playlist.replace('URI="aes.key"', f'URI="key://{digits}"'), encoding="ascii")
+
+        server, thread = serve(root)
+        try:
+            for name, digits, valid in cases:
+                server.requested.clear()
+                result = subprocess.run(
+                    [ffmpeg, "-nostdin", "-hide_banner", "-v", "warning",
+                     "-i", f"http://127.0.0.1:{server.server_port}/{name}.m3u8",
+                     "-map", "0", "-c", "copy", "-f", "framemd5", "-"],
+                    capture_output=True, timeout=60)
+                log = result.stderr.decode(errors="replace")[-4000:]
+                read = segments & set(server.requested)
+                if valid:
+                    assert result.returncode == 0 and read == segments, (name, server.requested, log)
+                    assert result.stdout.count(b"\n0,") >= 25, (name, log)
+                else:
+                    assert result.returncode, (name, log)
+                    assert not read, (name, sorted(read), log)
+                    assert b"\n0," not in result.stdout, (name, log)
+                    assert "Failed to parse key:// key" in log, (name, log)
+                    assert digits not in log, (name, log)
+                print(f"PASS HLS AES-128 key:// {name} ({len(digits)} digits): "
+                      f"{len(read)} of {len(segments)} segments read")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+
 def check_tls(ffmpeg):
     """The TLS options of the master playlist reach variant playlists, keys and segments."""
     if not shutil.which("openssl") or not re.search(
@@ -597,6 +652,7 @@ def main():
     args = parser.parse_args()
     if not args.realtime:
         check_dead_key(args.ffmpeg)
+        check_key_scheme(args.ffmpeg)
         check_tls(args.ffmpeg)
         check_low_speed(args.ffmpeg)
         check_cenc(args.ffmpeg)

@@ -2132,11 +2132,14 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
 
     if (!strncmp(seg->key, "key://", 6)) {
         /* the key is given directly as hex string */
-        if (strlen(seg->key + 6) != sizeof(pls->key) * 2)
-            av_log(pls->parent, AV_LOG_ERROR, "Failed to parse key %s - wrong key length\n",
-                   seg->key + 6);
-        else
-            ff_hex_to_data(pls->key, seg->key + 6);
+        uint8_t key[sizeof(pls->key)];
+        if (strlen(seg->key + 6) != sizeof(key) * 2 ||
+            ff_hex_to_data(key, seg->key + 6) != sizeof(key)) {
+            av_log(pls->parent, AV_LOG_ERROR,
+                   "Failed to parse key:// key - not %zu hex digits\n", sizeof(key) * 2);
+            return AVERROR_INVALIDDATA;
+        }
+        memcpy(pls->key, key, sizeof(key));
         av_strlcpy(pls->key_url, seg->key, sizeof(pls->key_url));
         return 0;
     }
