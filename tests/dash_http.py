@@ -483,6 +483,56 @@ def check_segment_query(ffmpeg, root):
         thread.join()
 
 
+def check_keys_not_logged(ffmpeg, root):
+    """Content keys do not reach the log, not even with -v debug: the DASH
+    keys of the options and of the manifest, and the key the mov demuxer
+    takes from decryption_keys. The command line itself is echoed at debug
+    level, those lines are left out."""
+    key, kid = "00112233445566778899aabbccddeeff", "0f0e0d0c0b0a09080706050403020100"
+    template = (root / "static.mpd").read_text()
+    (root / "keyed.mpd").write_text(
+        template.replace("<Representation ", f'<Representation cenc_decryption_key="{key}" ')
+                .replace("<Representation ", f'<Representation cenc_decryption_keys="{kid}={key}" ', 1))
+    assert "cenc_decryption_keys" in (root / "keyed.mpd").read_text(), template
+    run(ffmpeg, "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", str(root / "input.pcm"),
+        "-t", "2", "-c:a", "aac", "-f", "mp4",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-encryption_scheme", "cenc-aes-ctr", "-encryption_key", key,
+        "-encryption_kid", kid, str(root / "cenc.mp4"))
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *arguments, **keywords):
+            super().__init__(*arguments, directory=str(root), **keywords)
+
+        def log_message(self, *_):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        for name, source, options in (
+            ("DASH option", f"{base}/static.mpd", ("-cenc_decryption_audio_key", key)),
+            ("DASH manifest", f"{base}/keyed.mpd", ()),
+            ("mov decryption_keys", f"{base}/cenc.mp4", ("-decryption_keys", f"{kid}={key}")),
+        ):
+            result = subprocess.run(
+                [ffmpeg, "-nostdin", "-hide_banner", "-v", "debug", *options,
+                 "-i", source, "-map", "0", "-c", "copy", "-f", "null", "-"],
+                capture_output=True, timeout=60)
+            log = result.stderr.decode(errors="replace")
+            assert result.returncode == 0, (name, log[-4000:])
+            leaks = [line for line in log.splitlines() if key in line.lower()
+                     and "option" not in line.lower() and "argument" not in line.lower()]
+            assert not leaks, (name, leaks)
+            print(f"PASS content key not logged at debug level: {name}")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ffmpeg", required=True)
@@ -498,6 +548,7 @@ def main():
             "-use_template", "1", "-use_timeline", "1", "-adaptation_sets",
             "id=0,streams=0,1", "-f", "dash", str(root / "static.mpd"))
         check_segment_query(args.ffmpeg, root)
+        check_keys_not_logged(args.ffmpeg, root)
         run(args.ffmpeg, "-y", "-f", "s16le", "-ar", "48000", "-ac", "2",
             "-i", str(audio), "-t", "3", "-c:a", "aac", "-seg_duration", "1",
             "-single_file", "1", "-f", "dash", str(root / "range.mpd"))
