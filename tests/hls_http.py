@@ -728,19 +728,31 @@ def check_cenc(ffmpeg):
 
 
 def main():
+    checks = {"dead_key": check_dead_key, "key_scheme": check_key_scheme,
+              "sequence_wrap": check_sequence_wrap, "tls": check_tls,
+              "low_speed": check_low_speed, "cenc": check_cenc,
+              "mixed": None, "image_head": check_image_head}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ffmpeg", required=True)
     parser.add_argument("--driver", required=True)
     parser.add_argument("--realtime", action="store_true",
                         help="Clock-driven windows, delayed external reactivation and nonzero initial window")
+    parser.add_argument("--only", action="append", choices=checks, metavar="CHECK",
+                        help="Run only this check, may be repeated (%(choices)s); "
+                             "--realtime runs mixed only")
     args = parser.parse_args()
-    if not args.realtime:
-        check_dead_key(args.ffmpeg)
-        check_key_scheme(args.ffmpeg)
-        check_sequence_wrap(args.ffmpeg)
-        check_tls(args.ffmpeg)
-        check_low_speed(args.ffmpeg)
-        check_cenc(args.ffmpeg)
+    for name, check in checks.items():
+        if args.only and name not in args.only or args.realtime and name != "mixed":
+            continue
+        if check:
+            check(args.ffmpeg)
+        else:
+            check_mixed(args)
+
+
+def check_mixed(args):
+    """Mixed-TS HLS master playlists, VOD and live: seven audio/video
+    selections each, with the packet timeline against the reference."""
     with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-http-") as directory:
         root = Path(directory)
         generate(root, args.ffmpeg, markers=True, duration=70 if args.realtime else 40,
@@ -783,8 +795,6 @@ def main():
             server.shutdown()
             server.server_close()
             thread.join()
-    if not args.realtime:
-        check_image_head(args.ffmpeg)
 
 
 def image_heads():
