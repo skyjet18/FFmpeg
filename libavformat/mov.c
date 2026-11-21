@@ -8376,7 +8376,7 @@ static int get_key_from_kid(uint8_t* out, int len, MOVContext *c, AVEncryptionIn
         return -1;
     }
     ff_hex_to_data(out, key_entry_hex->value);
-    av_log(c->fc, AV_LOG_DEBUG, "Returning decryption key %s for kid %s\n", key_entry_hex->value, kid_hex);
+    av_log(c->fc, AV_LOG_DEBUG, "Returning decryption key for kid %s\n", kid_hex);
     return 0;
 }
 

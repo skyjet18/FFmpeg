@@ -1178,7 +1178,7 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
     val = xmlGetProp(representation_node, "cenc_decryption_key");
     if (val) {
         rep->cenc_decryption_key = av_strdup(val);
-        av_log(s, AV_LOG_INFO, "Setting key %s for %s\n", rep->cenc_decryption_key, rep->id);
+        av_log(s, AV_LOG_VERBOSE, "Setting key for %s\n", rep->id);
         xmlFree(val);
         if (!rep->cenc_decryption_key)
             goto enomem;
@@ -1190,21 +1190,21 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
             rep->cenc_decryption_key = av_strdup(c->cenc_decryption_video_key);
             if (!rep->cenc_decryption_key)
                 goto enomem;
-            av_log(s, AV_LOG_INFO, "Setting video key %s for %s\n", rep->cenc_decryption_key, rep->id);
+            av_log(s, AV_LOG_VERBOSE, "Setting video key for %s\n", rep->id);
         }
         else if (type == AVMEDIA_TYPE_AUDIO && c->cenc_decryption_audio_key != NULL)
         {
             rep->cenc_decryption_key = av_strdup(c->cenc_decryption_audio_key);
             if (!rep->cenc_decryption_key)
                 goto enomem;
-            av_log(s, AV_LOG_INFO, "Setting audio key %s for %s\n", rep->cenc_decryption_key, rep->id);
+            av_log(s, AV_LOG_VERBOSE, "Setting audio key for %s\n", rep->id);
         }
     }
 
     val = xmlGetProp(representation_node, "cenc_decryption_keys");
     if (val) {
         rep->cenc_decryption_keys = av_strdup(val);
-        av_log(s, AV_LOG_INFO, "Setting keys %s for %s\n", rep->cenc_decryption_keys, rep->id);
+        av_log(s, AV_LOG_VERBOSE, "Setting keys for %s\n", rep->id);
         xmlFree(val);
         if (!rep->cenc_decryption_keys)
             goto enomem;
