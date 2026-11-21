@@ -2265,6 +2265,10 @@ reload:
                    v->cur_seq_no, v->start_seq_no, v->start_seq_no + v->n_segments - 1, target_seq_no);
             v->cur_seq_no = target_seq_no;
             v->last_seq_no = target_seq_no - 1;
+            /* the prefetched next segment is one of the old sequence */
+            ff_format_io_close(v->parent, &v->input_next);
+            v->input_next_end = -1;
+            v->input_next_requested = 0;
         }
         if (v->cur_seq_no > v->last_seq_no) {
             v->last_seq_no = v->cur_seq_no;

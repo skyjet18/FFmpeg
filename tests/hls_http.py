@@ -332,6 +332,90 @@ def check_key_scheme(ffmpeg):
             thread.join()
 
 
+def check_sequence_wrap(ffmpeg):
+    """A live playlist whose media sequence restarts (1000.. -> 10..) without
+    a discontinuity while the next segment is prefetched (http_multiple):
+    the resync to the live edge requests the segment it resynced to, before
+    the prefetched segment of the old sequence was played in its place."""
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-wrap-") as directory:
+        root = Path(directory)
+        (root / "video.raw").write_bytes(bytes([96]) * (64 * 64 * 3 // 2 * 25 * 12))
+        run(ffmpeg, "-y", "-f", "rawvideo", "-pixel_format", "yuv420p", "-video_size", "64x64",
+            "-framerate", "25", "-i", str(root / "video.raw"),
+            "-c:v", "mpeg2video", "-g", "25", "-bf", "0",
+            "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
+            "-hls_segment_filename", str(root / "seg-%03d.ts"), str(root / "seg.m3u8"))
+        assert len(list(root.glob("seg-*.ts"))) >= 12, sorted(root.iterdir())
+
+        def playlist(prefix, sequence, finished):
+            return ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    f"#EXT-X-MEDIA-SEQUENCE:{sequence}\n"
+                    + "".join(f"#EXTINF:1.000000,\n{prefix}-{sequence + index}.ts\n"
+                              for index in range(6))
+                    + ("#EXT-X-ENDLIST\n" if finished else "")).encode()
+
+        class WrapHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                path = self.path.lstrip("/")
+                requested.append(path)
+                match = re.fullmatch(r"([ab])-(\d+)\.ts", path)
+                if path == "live.m3u8":
+                    # the first load: sequence 1000.., every reload: 10.. (end)
+                    first = requested.count("live.m3u8") == 1
+                    data = playlist("a", 1000, False) if first else playlist("b", 10, True)
+                elif match:
+                    # slow segments, so that the reload falls between two
+                    # segments with the next one already prefetched
+                    time.sleep(0.3)
+                    index = int(match[2]) - 1000 if match[1] == "a" else int(match[2]) - 10 + 6
+                    data = (root / f"seg-{index:03d}.ts").read_bytes()
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def handle(self):
+                try:
+                    super().handle()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_):
+                pass
+
+        requested = []
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), WrapHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            result = subprocess.run(
+                [ffmpeg, "-nostdin", "-hide_banner", "-v", "warning",
+                 "-http_multiple", "1", "-live_start_index", "0",
+                 "-i", f"http://127.0.0.1:{server.server_port}/live.m3u8",
+                 "-map", "0", "-c", "copy", "-f", "null", "-"],
+                capture_output=True, timeout=60)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        log = result.stderr.decode(errors="replace")[-4000:]
+        assert result.returncode == 0, log
+        assert "resyncing to live edge (seq 14)" in log, (requested, log)
+        new = [path for path in requested if path.startswith("b-")]
+        # before: the prefetched a-10xx segment was played as segment 14 and
+        # the first new request was b-15
+        assert new[:2] == ["b-14.ts", "b-15.ts"], (requested, log)
+        print(f"PASS HLS live sequence wrap 1000 -> 10 with prefetch: resynced to {new[0]}")
+
+
 def check_tls(ffmpeg):
     """The TLS options of the master playlist reach variant playlists, keys and segments."""
     if not shutil.which("openssl") or not re.search(
@@ -653,6 +737,7 @@ def main():
     if not args.realtime:
         check_dead_key(args.ffmpeg)
         check_key_scheme(args.ffmpeg)
+        check_sequence_wrap(args.ffmpeg)
         check_tls(args.ffmpeg)
         check_low_speed(args.ffmpeg)
         check_cenc(args.ffmpeg)
