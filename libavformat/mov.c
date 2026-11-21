@@ -50,6 +50,7 @@
 #include "libavutil/sha.h"
 #include "libavutil/spherical.h"
 #include "libavutil/stereo3d.h"
+#include "libavutil/time.h"
 #include "libavutil/timecode.h"
 #include "libavutil/uuid.h"
 #include "libavcodec/ac3tab.h"
@@ -8461,16 +8462,44 @@ static void bprint_base64_url(AVBPrint *bp, const uint8_t *data, unsigned size)
     av_free(b64);
 }
 
+#define CENC_KEY_RETRY_MIN  2
+#define CENC_KEY_RETRY_MAX 16
+
+/* Forget the failed key requests (value "-retry_time:failures") kept in the
+ * outermost context, so that they are made again at once. */
+static void cenc_keys_clear_failures(AVFormatContext *s)
+{
+    FFFormatContext *si;
+    const AVDictionaryEntry *e = NULL;
+    AVDictionary *keys = NULL;
+
+    while (ffformatcontext(s)->cenc_key_parent)
+        s = ffformatcontext(s)->cenc_key_parent;
+    si = ffformatcontext(s);
+    while ((e = av_dict_iterate(si->cenc_keys, e)))
+        if (e->value[0] != '-' && av_dict_set(&keys, e->key, e->value, 0) < 0) {
+            av_dict_free(&keys);
+            return;
+        }
+    av_dict_free(&si->cenc_keys);
+    si->cenc_keys = keys;
+}
+
 /**
  * Ask for the key of a KID that decryption_keys does not have: the
  * decryption_key_url template is filled in and opened with io_open of the
  * outermost context (for a demuxer of a DASH representation or HLS playlist
  * the one of the DASH or HLS demuxer, i.e. the caller's). The answer is the
- * key, 16 bytes or 32 hex digits. Every KID is asked for once; the answer
- * (also "no key") is kept in that outermost context, so the other
- * representations and playlists use it as well.
+ * key, 16 bytes or 32 hex digits. The answer is kept in that outermost
+ * context, so the other representations and playlists use it as well: the
+ * key, or "no key" if the answer is not a key or the request was refused
+ * (401, 403, or ENOENT, e.g. from an io_open of the application that answers
+ * the requests itself). Any other failure (network, 5xx, 404 for a KID the
+ * key service does not know yet) is kept only with a time: the KID is asked
+ * for again after CENC_KEY_RETRY_MIN seconds, doubled after every failure up
+ * to CENC_KEY_RETRY_MAX, or at once after a seek of this demuxer.
  *
- * @return 0 with the key in out, AVERROR(EACCES) if there is no key,
+ * @return 0 with the key in out, AVERROR(EACCES) if there is no key (yet),
  *         AVERROR_EXIT if the request was interrupted
  */
 static int cenc_request_key(MOVContext *c, MOVStreamContext *sc, const uint8_t *kid, uint8_t *out, int len)
@@ -8485,7 +8514,7 @@ static int cenc_request_key(MOVContext *c, MOVStreamContext *sc, const uint8_t *
     const char *p;
     char kid_hex[33], key_hex[33];
     uint8_t answer[128];
-    int ret, size = 0;
+    int ret, size = 0, failures = 0;
 
     while (ffformatcontext(top)->cenc_key_parent)
         top = ffformatcontext(top)->cenc_key_parent;
@@ -8493,6 +8522,13 @@ static int cenc_request_key(MOVContext *c, MOVStreamContext *sc, const uint8_t *
 
     ff_data_to_hex(kid_hex, kid, 16, 1);
     known = av_dict_get(si->cenc_keys, kid_hex, NULL, AV_DICT_MATCH_CASE);
+    if (known && known->value[0] == '-') {
+        int64_t retry_time;
+        if (sscanf(known->value, "-%"SCNd64":%d", &retry_time, &failures) != 2 ||
+            av_gettime_relative() < retry_time)
+            return AVERROR(EACCES);
+        known = NULL;
+    }
     if (known) {
         if (strlen(known->value) != (size_t)len * 2)
             return AVERROR(EACCES);
@@ -8576,12 +8612,25 @@ static int cenc_request_key(MOVContext *c, MOVStreamContext *sc, const uint8_t *
     if (ret < 0) {
         /* with decryption_key that one is used, it is not an error */
         int level = c->decryption_default_key ? AV_LOG_VERBOSE : AV_LOG_ERROR;
-        av_dict_set(&si->cenc_keys, kid_hex, "", 0);
-        if (ret == AVERROR_INVALIDDATA)
+        if (ret == AVERROR_INVALIDDATA) {
+            av_dict_set(&si->cenc_keys, kid_hex, "", 0);
             av_log(c->fc, level, "No key for KID %s: the answer (%d bytes) is not a key\n",
                    kid_hex, size);
-        else
+        } else if (ret == AVERROR_HTTP_UNAUTHORIZED || ret == AVERROR_HTTP_FORBIDDEN ||
+                   ret == AVERROR(ENOENT)) {
+            av_dict_set(&si->cenc_keys, kid_hex, "", 0);
             av_log(c->fc, level, "No key for KID %s: %s\n", kid_hex, av_err2str(ret));
+        } else {
+            /* maybe only for now: ask again later */
+            char failed[48];
+            int delay = FFMIN(CENC_KEY_RETRY_MIN << FFMIN(failures, 3), CENC_KEY_RETRY_MAX);
+
+            snprintf(failed, sizeof(failed), "-%"PRId64":%d",
+                     av_gettime_relative() + delay * INT64_C(1000000), failures + 1);
+            av_dict_set(&si->cenc_keys, kid_hex, failed, 0);
+            av_log(c->fc, level, "No key for KID %s yet: %s, asking again in %d s\n",
+                   kid_hex, av_err2str(ret), delay);
+        }
         return AVERROR(EACCES);
     }
 
@@ -12452,6 +12501,9 @@ static int mov_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
 
     if (stream_index >= s->nb_streams)
         return AVERROR_INVALIDDATA;
+
+    if (mc->decryption_key_url)
+        cenc_keys_clear_failures(s);
 
     st = s->streams[stream_index];
     sti = ffstream(st);
