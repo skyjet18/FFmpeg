@@ -205,8 +205,11 @@ def check_timeline(output, reference, initial):
 
 def check_dead_key(ffmpeg):
     """An AES-128 key that cannot be loaded is not requested again for every
-    try of every segment: a 404 once, a lasting 503 at most seg_max_retry + 1
-    times. A single 503 is still retried and the stream then plays."""
+    try of every segment: a 404 once, a lasting 503 seg_max_retry + 1 times
+    and then only at segments further and further apart. A single 503 is
+    still retried and the stream then plays, and after three 503s in a row
+    (the limit without seg_max_retry) the next segment asks again and the
+    rest of the stream plays."""
     retries = 3
     with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-dead-key-") as directory:
         root = Path(directory)
@@ -225,18 +228,21 @@ def check_dead_key(ffmpeg):
         assert 'URI="aes.key"' in playlist, playlist
         segments = {file.name for file in root.glob("aes-*.ts")}
         assert len(segments) >= 8, segments
-        for name in ("dead", "busy", "flaky"):
+        for name in ("dead", "busy", "flaky", "outage"):
             (root / f"{name}.m3u8").write_text(
                 playlist.replace('URI="aes.key"', f'URI="{name}.key"'), encoding="ascii")
-        (root / "busy.key").write_bytes(bytes(range(16)))
-        (root / "flaky.key").write_bytes(bytes(range(16)))
+        for name in ("busy", "flaky", "outage"):
+            (root / f"{name}.key").write_bytes(bytes(range(16)))
 
         server, thread = serve(root)
         try:
-            for name, unavailable, max_retry, success, key_requests in (
-                    ("dead", 0, retries, False, 1),
-                    ("busy", -1, retries, False, retries + 1),
-                    ("flaky", 1, 1, True, 2)):
+            for name, unavailable, max_retry, success, key_requests, lost in (
+                    ("dead", 0, retries, False, 1, 0),
+                    # the limit, then segments 1, 2, 4, 8 ... later
+                    ("busy", -1, retries, False, retries + 1 + len(segments).bit_length(), 0),
+                    ("flaky", 1, 1, True, 2, 0),
+                    # before: segment 4 and the rest skipped without a request
+                    ("outage", 3, 0, True, 4, 3)):
                 server.requested.clear()
                 server.unavailable = {f"{name}.key": unavailable} if unavailable else {}
                 result = subprocess.run(
@@ -252,14 +258,17 @@ def check_dead_key(ffmpeg):
                     name, count, len(segments), log)
                 if success:
                     assert result.returncode == 0, (name, log)
-                    assert segments <= set(server.requested), (
-                        name, sorted(segments - set(server.requested)), log)
+                    played = {segment for segment in segments
+                              if int(segment[4:7]) >= lost}
+                    assert played <= set(server.requested), (
+                        name, sorted(played - set(server.requested)), log)
                 else:
                     # the error still ends the open, no segment was read
                     assert result.returncode, (name, log)
                     assert not segments & set(server.requested), (name, server.requested)
                     assert "is not requested again" in log, (name, log)
-                answers = {0: "404", -1: "always 503", 1: "one 503"}[unavailable]
+                answers = {0: "404", -1: "always 503", 1: "one 503",
+                           3: "three 503"}[unavailable]
                 print(f"PASS HLS AES-128 key {name} ({answers}): "
                       f"{count} key request(s) for {len(segments)} segments")
         finally:

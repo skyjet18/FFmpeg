@@ -207,10 +207,13 @@ struct playlist {
     /* The key URL whose requests failed, how often in a row and the error of
      * the last try. Once it counts as failed for good (key_failed_for_good())
      * it is not requested again for the following segments until the
-     * playlist is reloaded or a segment names another key. */
+     * playlist is reloaded or a segment names another key; after an error
+     * that may pass (5xx, timeout) only until segment key_retry_seq_no or a
+     * seek. */
     char key_fail_url[MAX_URL_SIZE];
     int key_fail_count;
     int key_fail_ret;
+    int64_t key_retry_seq_no;
 
     /* ID3 timestamp handling (elementary audio streams have ID3 timestamps
      * (and possibly other ID3 tags) in the beginning of each segment) */
@@ -1860,6 +1863,16 @@ static void intercept_id3(struct playlist *pls, uint8_t *buf,
         pls->is_id3_timestamped = (pls->id3_mpegts_timestamp != AV_NOPTS_VALUE);
 }
 
+/* An answer that will not change: a 4xx other than 429, a missing file, a
+ * key of the wrong size. */
+static int key_fail_is_final(int ret)
+{
+    return ret == AVERROR_HTTP_BAD_REQUEST || ret == AVERROR_HTTP_UNAUTHORIZED ||
+           ret == AVERROR_HTTP_FORBIDDEN   || ret == AVERROR_HTTP_NOT_FOUND    ||
+           ret == AVERROR_HTTP_OTHER_4XX   || ret == AVERROR(ENOENT)           ||
+           ret == AVERROR_INVALIDDATA;
+}
+
 /* Whether the key URL of pls->key_fail_url is not requested again. An answer
  * that will not change (a 4xx other than 429, a missing file, a key of the
  * wrong size) counts at once, other errors (5xx, timeouts) after as many
@@ -1868,16 +1881,25 @@ static void intercept_id3(struct playlist *pls, uint8_t *buf,
  * requests per segment, a burst over the whole playlist. */
 static int key_failed_for_good(HLSContext *c, struct playlist *pls)
 {
-    int ret = pls->key_fail_ret;
-
     if (!pls->key_fail_count)
         return 0;
-    if (ret == AVERROR_HTTP_BAD_REQUEST || ret == AVERROR_HTTP_UNAUTHORIZED ||
-        ret == AVERROR_HTTP_FORBIDDEN   || ret == AVERROR_HTTP_NOT_FOUND    ||
-        ret == AVERROR_HTTP_OTHER_4XX   || ret == AVERROR(ENOENT)           ||
-        ret == AVERROR_INVALIDDATA)
+    if (key_fail_is_final(pls->key_fail_ret))
         return 1;
     return pls->key_fail_count >= FFMAX(c->seg_max_retry + 1, 3);
+}
+
+/* Whether the key of seg is not requested now: it failed for good, and after
+ * an error that may pass the segment is before the next one to try. The
+ * segments in between fail at once and are skipped, without a wait, so the
+ * gap is counted in segments, not in time: 1 segment after the failure that
+ * reached the limit, doubled after every further failure up to 64. */
+static int key_request_skipped(HLSContext *c, struct playlist *pls, struct segment *seg)
+{
+    if (!pls->key_fail_count || strcmp(pls->key_fail_url, seg->key) ||
+        !key_failed_for_good(c, pls))
+        return 0;
+    return key_fail_is_final(pls->key_fail_ret) ||
+           pls->cur_seq_no < pls->key_retry_seq_no;
 }
 
 static int key_failed(HLSContext *c, struct playlist *pls, struct segment *seg, int ret)
@@ -1891,10 +1913,17 @@ static int key_failed(HLSContext *c, struct playlist *pls, struct segment *seg, 
     }
     pls->key_fail_count++;
     pls->key_fail_ret = ret;
-    if (key_failed_for_good(c, pls))
+    if (key_fail_is_final(ret)) {
         av_log(pls->parent, AV_LOG_WARNING,
                "Key file %s is not requested again until the playlist is reloaded\n",
                seg->key);
+    } else if (key_failed_for_good(c, pls)) {
+        int over = pls->key_fail_count - FFMAX(c->seg_max_retry + 1, 3);
+        pls->key_retry_seq_no = pls->cur_seq_no + (INT64_C(1) << FFMIN(over, 6));
+        av_log(pls->parent, AV_LOG_WARNING,
+               "Key file %s is not requested again before segment %"PRId64"\n",
+               seg->key, pls->key_retry_seq_no);
+    }
     return ret;
 }
 
@@ -1922,8 +1951,7 @@ static int read_key(HLSContext *c, struct playlist *pls, struct segment *seg)
         return 0;
     }
 
-    if (pls->key_fail_count && !strcmp(pls->key_fail_url, seg->key) &&
-        key_failed_for_good(c, pls))
+    if (key_request_skipped(c, pls, seg))
         return pls->key_fail_ret;
 
     if (c->key_uri_replace_old && c->key_uri_replace_new &&
@@ -3476,6 +3504,9 @@ static void reset_playlist(struct playlist *pls)
     ff_format_io_close(pls->parent, &pls->input_next);
     pls->input_next_requested = 0;
     drop_segment_head(pls);
+    /* a key that failed with an error that may pass is requested again */
+    if (!key_fail_is_final(pls->key_fail_ret))
+        pls->key_fail_count = 0;
     av_packet_unref(pls->pkt);
     pb->eof_reached = 0;
     /* an error of the old position is not the one of the new position */
