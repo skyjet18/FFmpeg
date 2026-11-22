@@ -14,6 +14,40 @@ static AVStream *test_stream(AVFormatContext *s, int id, enum AVMediaType type,
     return stream;
 }
 
+static void test_subtitle_wait(void)
+{
+    HLSContext c = {.first_timestamp = 0, .av_timestamp = 0,
+                    .m3u8_hold_counters = 1000};
+    AVFormatContext *s = avformat_alloc_context();
+    struct segment segment = {.duration = 10000000};
+    struct segment *segments[] = {&segment, &segment, &segment, &segment, &segment};
+    struct playlist video = {.needed = 1};
+    struct playlist subtitle = {.parent = s, .needed = 1, .is_subtitle = 1,
+                                .finished = 1, .segments = segments, .n_segments = 5,
+                                .cur_seq_no = 3, .last_seq_no = 3,
+                                .subtitle_gate_origin = AV_NOPTS_VALUE};
+    struct playlist *playlists[] = {&video, &subtitle};
+
+    av_assert0(s);
+    s->priv_data = &c;
+    c.ctx = s;
+    c.playlists = playlists;
+    c.n_playlists = 2;
+    for (int i = 0; i < 1500; i++)
+        av_assert0(read_subtitle_packet(&subtitle, NULL) == AVERROR(EAGAIN));
+    av_assert0(!subtitle.m3u8_hold_counters);
+    c.av_timestamp = 20000000;
+    av_assert0(subtitle_segment_ready(&c, &subtitle));
+    subtitle.finished = 0;
+    subtitle.cur_seq_no = 5;
+    subtitle.last_load_time = av_gettime_relative();
+    for (int i = 0; i < 1500; i++)
+        av_assert0(read_subtitle_packet(&subtitle, NULL) == AVERROR(EAGAIN));
+    av_assert0(!subtitle.m3u8_hold_counters);
+    s->priv_data = NULL;
+    avformat_free_context(s);
+}
+
 static void test_stream_mapping(void)
 {
     HLSContext c = {0};
@@ -331,6 +365,7 @@ int main(void)
     int i;
 
     test_stream_mapping();
+    test_subtitle_wait();
     test_reactivation();
     test_window_offsets();
     test_window_reload();
