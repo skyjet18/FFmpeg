@@ -6068,7 +6068,8 @@ static void map_signoise(AC4DecodeContext *s, Substream *ss, int ch_id)
                 ssch->scf_sig_sb[atsg][sb] = ssch->scf_sig_sbg[atsg][sbg];
         }
 
-        if (ssch->atsg_sig[atsg] == ssch->atsg_noise[atsg_noise + 1])
+        if (atsg_noise + 1 < ssch->num_atsg_noise &&
+            ssch->atsg_sig[atsg] == ssch->atsg_noise[atsg_noise + 1])
             atsg_noise++;
 
         av_assert2(atsg_noise < FF_ARRAY_ELEMS(ssch->scf_noise_sbg));
