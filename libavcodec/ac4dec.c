@@ -1627,6 +1627,10 @@ static int ac4_toc(AC4DecodeContext *s)
     s->fs_index = get_bits1(gb);
     s->frame_rate_index = get_bits(gb, 4);
     av_log(s->avctx, AV_LOG_DEBUG, "frame_rate_index: %d\n", s->frame_rate_index);
+    if (!frame_len_base_48khz[s->frame_rate_index]) {
+        av_log(s->avctx, AV_LOG_ERROR, "reserved frame_rate_index: %d\n", s->frame_rate_index);
+        return AVERROR_INVALIDDATA;
+    }
     s->frame_len_base = frame_len_base_48khz[s->frame_rate_index];
     s->num_ts_in_ats = get_num_ts_in_ats(s->frame_len_base);
     s->frame_len_base_idx = frame_len_base_idx_48khz[s->frame_rate_index];
