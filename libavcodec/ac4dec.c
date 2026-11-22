@@ -6052,7 +6052,8 @@ static void map_signoise(AC4DecodeContext *s, Substream *ss, int ch_id)
     for (int atsg = 0; atsg < ssch->num_atsg_sig; atsg++) {
         /* Map Signal Envelopes from subband groups to QMF subbands */
         for (int sbg = 0; sbg < ssch->num_sbg_sig[ssch->atsg_freqres[atsg]]; sbg++) {
-            for (int sb = ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg]-ssch->sbx; sb < ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg+1]-ssch->sbx; sb++)
+            for (int sb = FFMAX(ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg]-ssch->sbx, 0);
+                 sb < FFMIN(ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg+1]-ssch->sbx, MAX_QMF_BANDS); sb++)
                 ssch->scf_sig_sb[atsg][sb] = ssch->scf_sig_sbg[atsg][sbg];
         }
 
@@ -6110,13 +6111,15 @@ static void add_sinusoids(AC4DecodeContext *s, Substream *ss, int ch_id)
         for (int sbg = 0; sbg < ssch->num_sbg_sig[ssch->atsg_freqres[atsg]]; sbg++) {
             int sine_present = 0;
             /* Additional sinusoid present in SF band? */
-            for (int sb = ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg]-ssch->sbx; sb < ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg+1]-ssch->sbx; sb++) {
+            for (int sb = FFMAX(ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg]-ssch->sbx, 0);
+                 sb < FFMIN(ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg+1]-ssch->sbx, MAX_QMF_BANDS); sb++) {
                 if (ssch->sine_idx_sb[atsg][sb] == 1)
                     sine_present = 1;
             }
 
             /* Mark all subbands in current subband group accordingly */
-            for (int sb = ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg]-ssch->sbx; sb < ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg+1]-ssch->sbx; sb++) {
+            for (int sb = FFMAX(ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg]-ssch->sbx, 0);
+                 sb < FFMIN(ssch->sbg_sig[ssch->atsg_freqres[atsg]][sbg+1]-ssch->sbx, MAX_QMF_BANDS); sb++) {
                 ssch->sine_area_sb[atsg][sb] = sine_present;
             }
         }
