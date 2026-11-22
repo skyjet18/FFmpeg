@@ -2679,6 +2679,10 @@ static int ext_decode(AC4DecodeContext *s)
     GetBitContext *gb = &s->gbc;
     int N_ext = get_unary(gb, 0, 17);
 
+    /* larger values do not fit into quant_lut[] */
+    if (N_ext > 8)
+        return AVERROR_INVALIDDATA;
+
     return (1 << (N_ext + 4)) + get_bits_long(gb, N_ext + 4);
 }
 
@@ -2769,10 +2773,15 @@ static int asf_spectral_data(AC4DecodeContext *s, Substream *ss, SubstreamChanne
                     }
 
                     if (ssch->sect_cb[g][i] == 11) {
-                        if (ssch->quant_spec[k] == 16)
-                            ssch->quant_spec[k] = ext_decode(s);
-                        if (ssch->quant_spec[k+1] == 16)
-                            ssch->quant_spec[k+1] = ext_decode(s);
+                        for (int n = 0; n < 2; n++) {
+                            if (ssch->quant_spec[k+n] == 16) {
+                                int ext = ext_decode(s);
+
+                                if (ext < 0)
+                                    return ext;
+                                ssch->quant_spec[k+n] = ext;
+                            }
+                        }
                     }
 
                     if (sign0)
