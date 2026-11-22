@@ -3074,34 +3074,47 @@ static int aspx_atsg(AC4DecodeContext *s, Substream *ss, SubstreamChannel *ssch,
         for (int atsg = 1; atsg < num_atsg_sig; atsg++)
             ssch->atsg_freqres[atsg] = ssch->atsg_freqres[0];
     } else {
+        int border[MAX_ASPX_SIGNAL + 1] = { 0 };
+
         switch (ssch->aspx_int_class) {
         case FIXVAR:
-            ssch->atsg_sig[0] = 0;
-            ssch->atsg_sig[num_atsg_sig] = ssch->aspx_var_bord_right + s->num_aspx_timeslots;
+            border[0] = 0;
+            border[num_atsg_sig] = ssch->aspx_var_bord_right + s->num_aspx_timeslots;
             for (int tsg = 0; tsg < ssch->aspx_num_rel_right; tsg++)
-                ssch->atsg_sig[num_atsg_sig-tsg-1] = ssch->atsg_sig[num_atsg_sig-tsg] - ssch->aspx_rel_bord_right[tsg];
+                border[num_atsg_sig-tsg-1] = border[num_atsg_sig-tsg] - ssch->aspx_rel_bord_right[tsg];
             break;
         case VARFIX:
             if (iframe)
-                ssch->atsg_sig[0] = ssch->aspx_var_bord_left;
+                border[0] = ssch->aspx_var_bord_left;
             else
-                ssch->atsg_sig[0] = ssch->previous_stop_pos - s->num_aspx_timeslots;
-            ssch->atsg_sig[num_atsg_sig] = s->num_aspx_timeslots;
+                border[0] = ssch->previous_stop_pos - s->num_aspx_timeslots;
+            border[num_atsg_sig] = s->num_aspx_timeslots;
             for (int tsg = 0; tsg < ssch->aspx_num_rel_left; tsg++)
-                ssch->atsg_sig[tsg+1] = ssch->atsg_sig[tsg] + ssch->aspx_rel_bord_left[tsg];
+                border[tsg+1] = border[tsg] + ssch->aspx_rel_bord_left[tsg];
             break;
         case VARVAR:
             if (iframe)
-                ssch->atsg_sig[0] = ssch->aspx_var_bord_left;
+                border[0] = ssch->aspx_var_bord_left;
             else
-                ssch->atsg_sig[0] = ssch->previous_stop_pos - s->num_aspx_timeslots;
-            ssch->atsg_sig[num_atsg_sig] = ssch->aspx_var_bord_right + s->num_aspx_timeslots;
+                border[0] = ssch->previous_stop_pos - s->num_aspx_timeslots;
+            border[num_atsg_sig] = ssch->aspx_var_bord_right + s->num_aspx_timeslots;
             for (int tsg = 0; tsg < ssch->aspx_num_rel_left; tsg++)
-                ssch->atsg_sig[tsg+1] = ssch->atsg_sig[tsg] + ssch->aspx_rel_bord_left[tsg];
+                border[tsg+1] = border[tsg] + ssch->aspx_rel_bord_left[tsg];
             for (int tsg = 0; tsg < ssch->aspx_num_rel_right; tsg++)
-                ssch->atsg_sig[num_atsg_sig-tsg-1] = ssch->atsg_sig[num_atsg_sig-tsg] - ssch->aspx_rel_bord_right[tsg];
+                border[num_atsg_sig-tsg-1] = border[num_atsg_sig-tsg] - ssch->aspx_rel_bord_right[tsg];
             break;
         }
+
+        /* Only the last border may lie beyond the frame, it is clipped below. */
+        for (int atsg = 0; atsg < num_atsg_sig; atsg++) {
+            if (border[atsg] < 0 || border[atsg] >= border[atsg + 1] ||
+                border[atsg] >= s->num_aspx_timeslots) {
+                av_log(s->avctx, AV_LOG_ERROR, "invalid aspx time slot group borders\n");
+                return AVERROR_INVALIDDATA;
+            }
+        }
+        for (int atsg = 0; atsg <= num_atsg_sig; atsg++)
+            ssch->atsg_sig[atsg] = border[atsg];
 
         ssch->atsg_noise[0] = ssch->atsg_sig[0];
         ssch->atsg_noise[num_atsg_noise] = ssch->atsg_sig[num_atsg_sig];
