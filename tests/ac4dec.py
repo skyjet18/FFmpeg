@@ -202,6 +202,10 @@ CASES = [
     ("five A-SPX noise subband groups",
      [frame(lambda w: mono_aspx(w, 0, 0, 1, 3, 0, 5))],
      None, OUT_BYTES),
+    ("A-SPX crossover offset beyond the master table",
+     [frame(lambda w: mono_aspx(w, 0, 0, 0, 2, 0, 4)),
+      frame(lambda w: mono_aspx(w, 7, 3, 0, 0, 1, 1))],
+     "invalid aspx xover subband offset", OUT_BYTES),
 ]
 
 
