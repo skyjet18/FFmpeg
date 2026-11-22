@@ -3451,6 +3451,11 @@ static int aspx_elements(AC4DecodeContext *s, Substream *ss, SubstreamChannel *s
     ssch->sba = ssch->sbg_master[0];
     ssch->sbz = ssch->sbg_master[ssch->num_sbg_master];
 
+    if (ssch->aspx_xover_subband_offset >= ssch->num_sbg_master) {
+        av_log(s->avctx, AV_LOG_ERROR, "invalid aspx xover subband offset: %d\n",
+               ssch->aspx_xover_subband_offset);
+        return AVERROR_INVALIDDATA;
+    }
     ssch->num_sbg_sig_highres = ssch->num_sbg_master - ssch->aspx_xover_subband_offset;
     av_log(s->avctx, AV_LOG_DEBUG, "num_sbg_sig_highres: %d\n", ssch->num_sbg_sig_highres);
     for (int sbg = 0; sbg <= ssch->num_sbg_sig_highres; sbg++)
