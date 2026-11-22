@@ -2333,6 +2333,9 @@ static int sf_info(AC4DecodeContext *s, Substream *ss,
     if (spec_frontend == SF_ASF) {
         asf_transform_info(s, ss, ssch);
         ret = asf_psy_info(s, ss, ssch, dual_maxsfb, side_limited);
+        /* do not leave a max_sfb that does not match the transform */
+        if (ret < 0)
+            ssch->scp.num_window_groups = 0;
     }
 
     return ret;
@@ -4159,13 +4162,18 @@ static int sf_info_lfe(AC4DecodeContext *s, Substream *ss,
     GetBitContext *gb = &s->gbc;
     int n_msfbl_bits = get_msfbl_bits(s->frame_len_base);
     int n_grp_bits = get_grp_bits(s, ssch);
+    int ret;
 
     ssch->scp.long_frame = 1;
     ssch->scp.max_sfb[0] = get_bits(gb, n_msfbl_bits);
     ssch->scp.num_window_groups = 1;
     ssch->scp.transf_length_idx[0] = 4;
 
-    return asf_psy_elements(s, ss, ssch, n_grp_bits);
+    ret = asf_psy_elements(s, ss, ssch, n_grp_bits);
+    if (ret < 0)
+        ssch->scp.num_window_groups = 0;
+
+    return ret;
 }
 
 static int mono_data(AC4DecodeContext *s, Substream *ss,
