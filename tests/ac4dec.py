@@ -196,6 +196,12 @@ CASES = [
     ("variable_bits overflow in substream_index",
      [frame(mono_simple, version=0, substream_index=[1] + [0] * 15)],
      None, 0),
+    ("five A-SPX patches",
+     [frame(lambda w: mono_aspx(w, 0, 0, 0, 2, 0, 4))],
+     None, OUT_BYTES),
+    ("five A-SPX noise subband groups",
+     [frame(lambda w: mono_aspx(w, 0, 0, 1, 3, 0, 5))],
+     None, OUT_BYTES),
 ]
 
 
