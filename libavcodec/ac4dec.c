@@ -1637,6 +1637,12 @@ static int ac4_toc(AC4DecodeContext *s)
         av_log(s->avctx, AV_LOG_ERROR, "reserved frame_rate_index: %d\n", s->frame_rate_index);
         return AVERROR_INVALIDDATA;
     }
+    if (s->frame_len_base && s->frame_len_base != frame_len_base_48khz[s->frame_rate_index]) {
+        /* the transform, overlap and QMF state of all channels depends on it */
+        av_log(s->avctx, AV_LOG_VERBOSE, "frame length changed, resetting\n");
+        memset(&s->substream, 0, sizeof(s->substream));
+        s->first_frame = 1;
+    }
     s->frame_len_base = frame_len_base_48khz[s->frame_rate_index];
     s->num_ts_in_ats = get_num_ts_in_ats(s->frame_len_base);
     s->frame_len_base_idx = frame_len_base_idx_48khz[s->frame_rate_index];
