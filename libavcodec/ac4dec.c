@@ -792,21 +792,26 @@ static av_cold int ac4_decode_init(AVCodecContext *avctx)
     return 0;
 }
 
+/* Larger values are invalid; callers shift and multiply them by up to 2^15. */
+#define VARIABLE_BITS_MAX 0xFFFF
+
 static int variable_bits(GetBitContext *gb, int bits)
 {
-    int value = 0;
+    unsigned value = 0;
     int read_more;
 
     do {
         value += get_bits(gb, bits);
         read_more = get_bits1(gb);
         if (read_more) {
+            if (value > VARIABLE_BITS_MAX)
+                return VARIABLE_BITS_MAX;
             value <<= bits;
             value += 1 << bits;
         }
     } while (read_more);
 
-    return value;
+    return FFMIN(value, VARIABLE_BITS_MAX);
 }
 
 static int check_sequence(AC4DecodeContext *s)
