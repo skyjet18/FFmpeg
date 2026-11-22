@@ -5614,9 +5614,8 @@ static int get_qsignal_scale_factors(AC4DecodeContext *s, Substream *ss, int ch_
                 v += delta * ssch->aspx_data[0][atsg][sbg];
             }
 
-            av_assert2(v >= -128);
-            av_assert2(v <=  128);
-            ssch->qscf_sig_sbg[atsg][sbg] = v;
+            /* the deltas are not limited by the bitstream */
+            ssch->qscf_sig_sbg[atsg][sbg] = av_clip_int8(v);
         }
     }
 
@@ -5652,8 +5651,7 @@ static int get_qnoise_scale_factors(AC4DecodeContext *s, Substream *ss, int ch_i
                 }
             }
 
-            av_assert2(ssch->qscf_noise_sbg[atsg][sbg] >= -63);
-            av_assert2(ssch->qscf_noise_sbg[atsg][sbg] <=  63);
+            ssch->qscf_noise_sbg[atsg][sbg] = av_clip(ssch->qscf_noise_sbg[atsg][sbg], -63, 63);
         }
     }
 
