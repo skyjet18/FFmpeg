@@ -267,6 +267,10 @@ struct playlist {
     int n_init_sections;
     struct segment **init_sections;
     int is_subtitle; /* Indicates if it's a subtitle playlist */
+    /* Live subtitle playlist: where the first segment of its window is on
+     * the audio/video timeline, estimated when it was switched in (see
+     * subtitle_segment_ready()); only used to pace the segment requests. */
+    int64_t subtitle_gate_origin;
 
     /* Some HLS streams repeat the current timed-ID3 metadata at every segment
      * boundary so late-joining clients get a fresh copy. Track the last seen
@@ -354,6 +358,9 @@ typedef struct HLSContext {
     HLSCryptoContext  crypto_ctx;
     int hls_quality_mode;
     int hls_audio_default_only;
+    /* playing position of the audio/video playlists on the timeline of
+     * c->first_timestamp (subtitle packets left out) */
+    int64_t av_timestamp;
     /* the variant whose main playlist tells duration and seekability:
      * the one chosen by hls_quality_mode, else the first */
     int selected_variant;
@@ -474,6 +481,7 @@ static struct playlist *new_playlist(HLSContext *c, const char *url,
     pls->seek_timestamp = AV_NOPTS_VALUE;
     pls->discontinuity_offset = 0;
     pls->timeline_time = AV_NOPTS_VALUE;
+    pls->subtitle_gate_origin = AV_NOPTS_VALUE;
 
     pls->is_id3_timestamped = -1;
     pls->id3_mpegts_timestamp = AV_NOPTS_VALUE;
@@ -1556,6 +1564,16 @@ static int parse_playlist(HLSContext *c, const char *url,
         }
     }
     if (prev_segments) {
+        if (pls->is_subtitle && pls->subtitle_gate_origin != AV_NOPTS_VALUE) {
+            /* the window moved on: its first segment starts later */
+            int64_t diff = pls->start_seq_no - prev_start_seq_no;
+            if (diff < 0 || diff > prev_n_segments)
+                pls->subtitle_gate_origin = AV_NOPTS_VALUE;
+            else
+                for (int64_t k = 0; k < diff; k++)
+                    pls->subtitle_gate_origin = av_sat_add64(pls->subtitle_gate_origin,
+                                                             prev_segments[k]->duration);
+        }
         if (pls->start_seq_no > prev_start_seq_no && c->first_timestamp != AV_NOPTS_VALUE &&
             c->first_timestamp_pls == pls) {
             int64_t prev_timestamp = c->first_timestamp;
@@ -2766,16 +2784,23 @@ static int nested_io_open(AVFormatContext *s, AVIOContext **pb, const char *url,
     return AVERROR(EPERM);
 }
 
-static int init_subtitle_context(struct playlist *pls)
+/* Open the WebVTT demuxer on the current segment. *unsupported is set if the
+ * segment is readable but not WebVTT (e.g. WebVTT or TTML in fragmented MP4),
+ * which this demuxer does not read. */
+static int init_subtitle_context(struct playlist *pls, int *unsupported)
 {
     HLSContext *c = pls->parent->priv_data;
-    const AVInputFormat *in_fmt;
+    const AVInputFormat *in_fmt, *detected = NULL;
     AVDictionary *opts = NULL;
     int ret;
 
+    *unsupported = 0;
     if (!(pls->ctx = avformat_alloc_context()))
         return AVERROR(ENOMEM);
 
+    /* the buffer of the previous segment (a custom I/O context is not freed
+     * with the demuxer) */
+    av_freep(&pls->pb.pub.buffer);
     pls->read_buffer = av_malloc(INITIAL_BUFFER_SIZE);
     if (!pls->read_buffer) {
         avformat_free_context(pls->ctx);
@@ -2791,26 +2816,113 @@ static int init_subtitle_context(struct playlist *pls)
 
     ret = ff_copy_whiteblacklists(pls->ctx, pls->parent);
     if (ret < 0)
-        return ret;
+        goto fail;
 
+    ret = av_probe_input_buffer2(&pls->pb.pub, &detected,
+                                 current_segment(pls)->url, NULL, 0, 0);
+    if (ret < 0)
+        goto fail;
     in_fmt = av_find_input_format("webvtt");
+    if (ret <= AVPROBE_SCORE_RETRY || detected != in_fmt) {
+        /* a format told apart for sure is one of the whole rendition, a
+         * guess may be a single broken segment (an error page) */
+        if (detected && detected != in_fmt && ret > AVPROBE_SCORE_RETRY) {
+            av_log(pls->parent, AV_LOG_WARNING,
+                   "Subtitle segments of playlist %d are %s, only WebVTT is supported\n",
+                   pls->index, detected->name);
+            *unsupported = 1;
+        }
+        ret = AVERROR_INVALIDDATA;
+        goto fail;
+    }
+    ret = test_segment(pls->parent, in_fmt, pls, current_segment(pls));
+    if (ret < 0)
+        goto fail;
+
     av_dict_copy(&opts, c->seg_format_opts, 0);
     ret = avformat_open_input(&pls->ctx, current_segment(pls)->url, in_fmt, &opts);
     av_dict_free(&opts);
 
     return ret;
+fail:
+    avformat_free_context(pls->ctx);
+    pls->ctx = NULL;
+    return ret;
+}
+
+/* May the next segment of subtitle playlist pls be loaded? Only if it starts
+ * at most one segment after the one the audio/video playlists are in: a
+ * selected subtitle rendition is read on demand, not to its end (thousands
+ * of mostly empty segments in a long video) as soon as it is switched in. */
+static int subtitle_segment_ready(HLSContext *c, struct playlist *pls)
+{
+    int has_av = 0;
+    int64_t origin, pos, i, current = 0;
+
+    for (i = 0; i < c->n_playlists; i++)
+        if (!c->playlists[i]->is_subtitle && c->playlists[i]->needed)
+            has_av = 1;
+    if (!has_av)
+        return 1;
+    if (c->av_timestamp == AV_NOPTS_VALUE)
+        return 0;
+
+    if (pls->finished) {
+        if (c->first_timestamp == AV_NOPTS_VALUE)
+            return 0;
+        origin = segment_start_time(c, pls, pls->start_seq_no);
+    } else {
+        /* A live window has no timeline anchor for subtitles (their cues
+         * say nothing about where a segment starts): the segment selected
+         * when the playlist was switched in is taken to start at the
+         * position played then. Only paces the requests, the timestamps of
+         * the cues are not touched. */
+        if (pls->subtitle_gate_origin == AV_NOPTS_VALUE) {
+            int64_t n = av_clip64(pls->cur_seq_no - pls->start_seq_no, 0, pls->n_segments);
+            origin = c->av_timestamp;
+            for (i = 0; i < n; i++)
+                origin = av_sat_sub64(origin, pls->segments[i]->duration);
+            pls->subtitle_gate_origin = origin;
+        }
+        origin = pls->subtitle_gate_origin;
+    }
+
+    pos = origin;
+    while (current + 1 < pls->n_segments &&
+           c->av_timestamp >= av_sat_add64(pos, pls->segments[current]->duration)) {
+        pos = av_sat_add64(pos, pls->segments[current]->duration);
+        current++;
+    }
+    return pls->cur_seq_no - pls->start_seq_no <= current + 1;
 }
 
 static int read_subtitle_packet(struct playlist *v, AVPacket *pkt)
 {
     HLSContext *c = v->parent->priv_data;
     struct segment *seg;
-    int ret;
+    int ret, unsupported;
 
 restart:
+    if (!v->ctx) {
+        int64_t index = v->cur_seq_no - v->start_seq_no;
+        /* no request before the audio/video playlists get near the segment */
+        if (index >= 0 && index < v->n_segments && !subtitle_segment_ready(c, v))
+            return AVERROR(EAGAIN);
+        /* at the end of a live window wait for the reload interval, instead
+         * of reloading the playlist for every packet of the others */
+        if (index >= v->n_segments && !v->finished &&
+            av_gettime_relative() - v->last_load_time < default_reload_interval(v))
+            return AVERROR(EAGAIN);
+    }
     ret = reload_playlist(v, c);
-    if (ret < 0)
+    if (ret < 0) {
+        /* a failed reload is tried again after the reload interval */
+        if (ret != AVERROR_EOF && ret != AVERROR_EXIT)
+            v->last_load_time = av_gettime_relative();
         return ret;
+    }
+    if (!v->ctx && !subtitle_segment_ready(c, v))
+        return AVERROR(EAGAIN);
 
     if (v->input && !v->ctx)
         ff_format_io_close(v->parent, &v->input);
@@ -2831,18 +2943,39 @@ restart:
                 v->discontinuity_offset = offset;
         }
 
-        ret = init_subtitle_context(v);
-        if (ret < 0)
-            return ret;
+        ret = init_subtitle_context(v, &unsupported);
+        if (ret == AVERROR_EXIT || ret == AVERROR(ENOMEM) ||
+            ff_check_interrupt(c->interrupt_callback))
+            return ret < 0 ? ret : AVERROR_EXIT;
+        if (unsupported) {
+            /* the other segments are no different: stop requesting them */
+            ff_format_io_close(v->parent, &v->input);
+            v->broken = 1;
+            v->needed = 0;
+            return AVERROR_EOF;
+        }
+        if (ret < 0) {
+            /* A missing or broken subtitle segment loses its cues, not
+             * the playback: go on with the next one. */
+            av_log(v->parent, AV_LOG_WARNING,
+                   "Skipping subtitle segment %"PRId64" of playlist %d: %s\n",
+                   v->cur_seq_no, v->index, av_err2str(ret));
+            goto next_segment;
+        }
     }
 
     ret = av_read_frame(v->ctx, v->pkt);
     if (!ret) {
         return ret;
     }
+    if (ret == AVERROR_EXIT)
+        return ret;
+next_segment:
     ff_format_io_close(v->parent, &v->input);
     v->cur_seq_no++;
-    c->cur_seq_no = v->cur_seq_no;
+    /* c->cur_seq_no stays the one of the audio/video playlists: a playlist
+     * switched in during live playback starts there (select_cur_seq_no()),
+     * and subtitles are read up to one segment ahead. */
 
     avformat_close_input(&v->ctx);
 
@@ -3269,11 +3402,46 @@ static int update_streams_from_subdemuxer(AVFormatContext *s, struct playlist *p
     pls->main_streams = mapping;
     pls->n_main_streams = pls->ctx->nb_streams;
     av_free(used);
+    /* set_stream_info_from_input_stream() took the disposition and the
+     * metadata of the segment demuxer, which knows nothing of the
+     * rendition (language, name, DEFAULT, FORCED) */
+    if (pls->is_subtitle)
+        add_metadata_from_renditions(s, pls, AVMEDIA_TYPE_SUBTITLE);
     return 0;
 fail:
     av_free(mapping);
     av_free(used);
     return err;
+}
+
+/* The stream of a subtitle rendition, created without loading its playlist
+ * or a segment: WebVTT, discarded until the caller selects it. */
+static int add_lazy_subtitle_stream(AVFormatContext *s, struct playlist *pls)
+{
+    AVStream *st = avformat_new_stream(s, NULL);
+    struct hls_stream entry;
+
+    if (!st)
+        return AVERROR(ENOMEM);
+    st->id = pls->index;
+    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+    st->codecpar->codec_id   = AV_CODEC_ID_WEBVTT;
+    st->discard = AVDISCARD_ALL;
+    avpriv_set_pts_info(st, 33, 1, MPEG_TIME_BASE);
+    /* the WebVTT demuxer has a single stream with id 0 */
+    entry = (struct hls_stream){ .stream = st, .id = 0 };
+    if (!av_dynarray2_add((void **)&pls->associated_streams,
+                          &pls->n_associated_streams, sizeof(entry),
+                          (const uint8_t *)&entry))
+        return AVERROR(ENOMEM);
+    pls->main_streams = av_malloc(sizeof(*pls->main_streams));
+    if (!pls->main_streams)
+        return AVERROR(ENOMEM);
+    pls->main_streams[0] = st;
+    pls->n_main_streams  = 1;
+    add_stream_to_programs(s, pls, st);
+    add_metadata_from_renditions(s, pls, AVMEDIA_TYPE_SUBTITLE);
+    return 0;
 }
 
 static void update_noheader_flag(AVFormatContext *s)
@@ -3399,6 +3567,7 @@ static int hls_read_header(AVFormatContext *s)
     c->cur_timestamp = AV_NOPTS_VALUE;
     c->n_disc_offsets = 0;
     c->disc_offsets_next = 0;
+    c->av_timestamp = AV_NOPTS_VALUE;
 
     if ((ret = ffio_copy_url_options(s->pb, &c->avio_opts)) < 0)
         return ret;
@@ -3437,7 +3606,8 @@ static int hls_read_header(AVFormatContext *s)
     if (c->n_playlists > 1 || c->playlists[0]->n_segments == 0) {
         for (i = 0; i < c->n_playlists; i++) {
             struct playlist *pls = c->playlists[i];
-            if (pls->excluded)
+            /* subtitle renditions are loaded when they are selected */
+            if (pls->excluded || pls->is_subtitle)
                 continue;
             pls->m3u8_hold_counters = 0;
             if ((ret = parse_playlist(c, pls->url, pls, NULL)) < 0) {
@@ -3517,6 +3687,17 @@ static int hls_read_header(AVFormatContext *s)
         if (pls->excluded)
             continue;
 
+        if (pls->is_subtitle) {
+            /* neither playlist nor segment are loaded until it is selected
+             * (recheck_discard_flags()) */
+            pls->index  = i;
+            pls->parent = s;
+            ret = add_lazy_subtitle_stream(s, pls);
+            if (ret < 0)
+                return ret;
+            continue;
+        }
+
         if (!(pls->ctx = avformat_alloc_context()))
             return AVERROR(ENOMEM);
         ffformatcontext(pls->ctx)->cenc_key_parent = s;
@@ -3550,12 +3731,8 @@ static int hls_read_header(AVFormatContext *s)
             return AVERROR(ENOMEM);
         }
 
-        if (pls->is_subtitle)
-            ffio_init_context(&pls->pb, (unsigned char*)av_strdup("WEBVTT\n"), (int)strlen("WEBVTT\n"), 0, pls,
-                                       NULL, NULL, NULL);
-        else
-            ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
-                                        read_data_continuous, NULL, NULL);
+        ffio_init_context(&pls->pb, pls->read_buffer, INITIAL_BUFFER_SIZE, 0, pls,
+                          read_data_continuous, NULL, NULL);
 
         /*
          * If encryption scheme is SAMPLE-AES, try to read  ID3 tags of
@@ -3720,13 +3897,6 @@ static int hls_read_header(AVFormatContext *s)
         if (pls->n_main_streams)
             av_dict_copy(&pls->main_streams[0]->metadata, pls->ctx->metadata, 0);
 
-        if (pls->is_subtitle) {
-            avformat_free_context(pls->ctx);
-            pls->ctx = NULL;
-            pls->needed = 0;
-            pls->main_streams[0]->discard = AVDISCARD_ALL;
-        }
-
         add_metadata_from_renditions(s, pls, AVMEDIA_TYPE_AUDIO);
         add_metadata_from_renditions(s, pls, AVMEDIA_TYPE_VIDEO);
         add_metadata_from_renditions(s, pls, AVMEDIA_TYPE_SUBTITLE);
@@ -3789,6 +3959,26 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             continue;
         }
         if (cur_needed && !pls->needed) {
+            if (pls->is_subtitle && !pls->last_load_time) {
+                /* a subtitle rendition selected for the first time */
+                int ret;
+                pls->m3u8_hold_counters = 0;
+                ret = parse_playlist(c, pls->url, pls, NULL);
+                if (ret == AVERROR_EXIT)
+                    return ret;
+                if (ret < 0 || !pls->n_segments) {
+                    /* not requested again on every packet */
+                    av_log(s, AV_LOG_WARNING, "Subtitle playlist %d failed to load: %s\n",
+                           i, ret < 0 ? av_err2str(ret) : "no segments");
+                    pls->broken = 1;
+                    continue;
+                }
+            }
+            if (pls->is_subtitle) {
+                /* re-estimated from the position played now */
+                pls->subtitle_gate_origin = AV_NOPTS_VALUE;
+                pls->m3u8_hold_counters = 0;
+            }
             pls->needed = 1;
             changed = 1;
             /* A playlist switched in during playback may have been read
@@ -3801,6 +3991,9 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
             if (!first)
                 reset_playlist(pls);
             pls->cur_seq_no = select_cur_seq_no(c, pls);
+            if (pls->is_subtitle)
+                /* not a repeated request of the same segment */
+                pls->last_seq_no = pls->cur_seq_no;
             discontinuity_select(c, pls, 1);
             pls->pb.pub.eof_reached = 0;
             if (c->cur_timestamp != AV_NOPTS_VALUE) {
@@ -3811,7 +4004,12 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
                 pls->seek_stream_index = -1;
             }
             av_log(s, AV_LOG_INFO, "Now receiving playlist %d, segment %"PRId64"\n", i, pls->cur_seq_no);
-        } else if (first && !cur_needed && pls->needed) {
+        } else if ((first || pls->is_subtitle) && !cur_needed && pls->needed) {
+            /* A subtitle rendition switched off during playback stops at
+             * once: its buffered cue belongs to a discarded stream, and no
+             * further segment is requested. */
+            if (pls->is_subtitle)
+                av_packet_unref(pls->pkt);
             ff_format_io_close(pls->parent, &pls->input);
             pls->input_read_done = 0;
             ff_format_io_close(pls->parent, &pls->input_next);
@@ -3914,6 +4112,12 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                 else
                     ret = av_read_frame(pls->ctx, pls->pkt);
                 if (ret < 0) {
+                    /* No cue now (the next segment is not due yet, the end
+                     * of a live window, a failed reload): the audio/video
+                     * packets go on. */
+                    if (pls->is_subtitle && ret != AVERROR_EXIT &&
+                        ret != AVERROR(ENOMEM))
+                        break;
                     if (pls->discontinuity_pending) {
                         /* The next segment starts a new discontinuity
                          * region: restart the segment demuxer on it (like
@@ -4006,7 +4210,9 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                                               pls->discontinuity_offset);
                     }
 
-                    if (pls->ts_offset == AV_NOPTS_VALUE &&
+                    /* not from a cue: it starts anywhere in its segment,
+                     * not at the segment start this offset stands for */
+                    if (pls->ts_offset == AV_NOPTS_VALUE && !pls->is_subtitle &&
                         pls->pkt->dts    != AV_NOPTS_VALUE) {
                         int64_t seg_idx = pls->cur_seq_no - pls->start_seq_no;
                         int64_t ts = av_rescale_q(pls->pkt->dts,
@@ -4073,6 +4279,13 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                     ts_diff = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
                                             tb.den, AV_ROUND_DOWN) -
                             pls->seek_timestamp;
+                    /* a cue that began before the target is kept if it is
+                     * still on screen there */
+                    if (pls->is_subtitle && ts_diff < 0 &&
+                        (pls->seek_flags & AVSEEK_FLAG_ANY) &&
+                        av_sat_add64(ts_diff, av_rescale_q(pls->pkt->duration, tb,
+                                                           AV_TIME_BASE_Q)) > 0)
+                        ts_diff = 0;
                     if (ts_diff >= 0 && (pls->seek_flags  & AVSEEK_FLAG_ANY ||
                                         pls->pkt->flags & AV_PKT_FLAG_KEY)) {
                         pls->seek_timestamp = AV_NOPTS_VALUE;
@@ -4159,10 +4372,15 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
         av_packet_move_ref(pkt, pls->pkt);
         pkt->stream_index = st->index;
 
-        if (pkt->dts != AV_NOPTS_VALUE)
+        /* The playing position: a cue, read up to a segment ahead, is not
+         * (a playlist switched in would start a segment late). */
+        if (pkt->dts != AV_NOPTS_VALUE && !pls->is_subtitle) {
             c->cur_timestamp = av_rescale_q(pkt->dts,
                                             ist->time_base,
                                             AV_TIME_BASE_Q);
+            c->av_timestamp = av_sat_sub64(c->cur_timestamp,
+                pls->ts_offset != AV_NOPTS_VALUE ? pls->ts_offset : 0);
+        }
 
         /* There may be more situations where this would be useful, but this at least
          * handles newly probed codecs properly (i.e. request_probe by mpegts). */
@@ -4267,6 +4485,8 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         }
 
         pls->last_seq_no = pls->cur_seq_no;
+        if (pls->is_subtitle)
+            pls->m3u8_hold_counters = 0;
 
         /* the seek restarted the segment demuxer, continue the timeline
          * from the region of the segment seeked to */
@@ -4274,6 +4494,8 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     }
 
     c->cur_timestamp = seek_timestamp;
+    /* seek_timestamp is on the timeline of c->first_timestamp */
+    c->av_timestamp  = seek_timestamp;
 
     return 0;
 }

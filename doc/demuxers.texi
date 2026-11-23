@@ -588,6 +588,15 @@ the caller can decide which variant streams to actually receive.
 The total bitrate of the variant that the stream belongs to is
 available in a metadata key named "variant_bitrate".
 
+External subtitle renditions are listed as WebVTT streams without loading
+their playlists or segments and are initially discarded. The caller can
+enable one with its discard flag; its playlist is loaded then, and its
+segments on demand, at most one segment ahead of the audio/video playback
+position. A live rendition starts at the segment selected when it is enabled,
+which is taken to start at the position played then. A missing or unreadable
+subtitle segment is skipped. Only WebVTT segments are supported: a rendition
+whose segments are in another format is dropped when it is enabled.
+
 It accepts the following options:
 
 @table @option

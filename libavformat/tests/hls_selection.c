@@ -331,8 +331,112 @@ static void test_live_switch_in(void)
     av_assert0(select_cur_seq_no(&c, &pls) == 112);
 }
 
+/* A selected subtitle rendition is read at most one segment ahead of the
+ * audio/video position, and waiting for that requests nothing and does not
+ * count as a playlist that holds. */
+static void test_subtitle_wait(void)
+{
+    HLSContext c = {.first_timestamp = 0, .av_timestamp = 0,
+                    .m3u8_hold_counters = 1000};
+    AVFormatContext *s = avformat_alloc_context();
+    struct segment segment = {.duration = 10000000};
+    struct segment *segments[] = {&segment, &segment, &segment, &segment, &segment};
+    struct playlist video = {.needed = 1};
+    struct playlist subtitle = {.parent = s, .needed = 1, .is_subtitle = 1,
+                                .finished = 1, .segments = segments, .n_segments = 5,
+                                .cur_seq_no = 3, .last_seq_no = 3,
+                                .timeline_time = AV_NOPTS_VALUE,
+                                .subtitle_gate_origin = AV_NOPTS_VALUE};
+    struct playlist *playlists[] = {&video, &subtitle};
+
+    av_assert0(s);
+    s->priv_data = &c;
+    c.ctx = s;
+    c.playlists = playlists;
+    c.n_playlists = 2;
+    for (int i = 0; i < 1500; i++)
+        av_assert0(read_subtitle_packet(&subtitle, NULL) == AVERROR(EAGAIN));
+    av_assert0(!subtitle.m3u8_hold_counters);
+    /* segment 2 is played: segment 3 may be loaded, segment 4 not yet */
+    c.av_timestamp = 20000000;
+    av_assert0(subtitle_segment_ready(&c, &subtitle));
+    subtitle.cur_seq_no = 4;
+    av_assert0(!subtitle_segment_ready(&c, &subtitle));
+    c.av_timestamp = 29999999;
+    av_assert0(!subtitle_segment_ready(&c, &subtitle));
+    c.av_timestamp = 30000000;
+    av_assert0(subtitle_segment_ready(&c, &subtitle));
+    /* no audio/video position yet: nothing */
+    c.av_timestamp = AV_NOPTS_VALUE;
+    av_assert0(!subtitle_segment_ready(&c, &subtitle));
+    /* no audio/video playlist: the subtitles are all there is */
+    video.needed = 0;
+    av_assert0(subtitle_segment_ready(&c, &subtitle));
+    video.needed = 1;
+
+    /* live: the segment selected is taken to start at the position played
+     * when the rendition was switched in */
+    subtitle.finished = 0;
+    subtitle.cur_seq_no = 2;
+    c.av_timestamp = 500000000;
+    av_assert0(subtitle_segment_ready(&c, &subtitle));
+    av_assert0(subtitle.subtitle_gate_origin == 480000000);
+    subtitle.cur_seq_no = 3;
+    av_assert0(subtitle_segment_ready(&c, &subtitle));
+    subtitle.cur_seq_no = 4;
+    av_assert0(!subtitle_segment_ready(&c, &subtitle));
+    c.av_timestamp = 510000000;
+    av_assert0(subtitle_segment_ready(&c, &subtitle));
+
+    /* the end of a live window: no reload before its interval */
+    subtitle.cur_seq_no = 5;
+    subtitle.last_load_time = av_gettime_relative();
+    for (int i = 0; i < 1500; i++)
+        av_assert0(read_subtitle_packet(&subtitle, NULL) == AVERROR(EAGAIN));
+    av_assert0(!subtitle.m3u8_hold_counters);
+    s->priv_data = NULL;
+    avformat_free_context(s);
+}
+
+/* The stream of a subtitle rendition that is not loaded yet: WebVTT,
+ * discarded, with the language and disposition of the rendition. */
+static void test_lazy_subtitle_stream(void)
+{
+    HLSContext c = {0};
+    AVFormatContext *s = avformat_alloc_context();
+    struct rendition rend = {.type = AVMEDIA_TYPE_SUBTITLE,
+                             .disposition = AV_DISPOSITION_FORCED};
+    struct rendition *rends[] = {&rend};
+    struct playlist pls = {.parent = s, .index = 3, .is_subtitle = 1,
+                           .renditions = rends, .n_renditions = 1};
+
+    av_assert0(s);
+    s->priv_data = &c;
+    c.ctx = s;
+    strcpy(rend.language, "de");
+    av_assert0(add_lazy_subtitle_stream(s, &pls) == 0);
+    av_assert0(s->nb_streams == 1 && pls.n_main_streams == 1);
+    av_assert0(s->streams[0]->id == 3);
+    av_assert0(s->streams[0]->discard == AVDISCARD_ALL);
+    av_assert0(s->streams[0]->codecpar->codec_id == AV_CODEC_ID_WEBVTT);
+    av_assert0(s->streams[0]->disposition & AV_DISPOSITION_FORCED);
+    av_assert0(!strcmp(av_dict_get(s->streams[0]->metadata, "language", NULL, 0)->value, "de"));
+    /* not needed while discarded, without a demuxer context */
+    av_assert0(av_new_program(s, 0));
+    av_program_add_stream_index(s, 0, 0);
+    av_assert0(!playlist_needed(&pls));
+    s->streams[0]->discard = AVDISCARD_DEFAULT;
+    av_assert0(playlist_needed(&pls));
+    av_freep(&pls.main_streams);
+    av_freep(&pls.associated_streams);
+    s->priv_data = NULL;
+    avformat_free_context(s);
+}
+
 int main(void)
 {
+    test_subtitle_wait();
+    test_lazy_subtitle_stream();
     test_live_switch_in();
     test_stream_mapping();
     test_stream_mapping_edges();
