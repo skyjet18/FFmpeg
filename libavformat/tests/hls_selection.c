@@ -263,19 +263,58 @@ static void test_sequence_reset(void)
     av_assert0(!reload_playlist(&pls, &c) && pls.cur_seq_no == 34 && pls.last_seq_no == 34);
 }
 
-/* An EVENT playlist that is not finished starts like any live playlist. */
+/* An EVENT playlist that is not finished starts on its first segment,
+ * unless #EXT-X-START applies or live_start_index was set; then it starts
+ * like any live playlist. Live playlists start as before. */
 static void test_event_start(void)
 {
     struct segment seg = {.duration = 300000};
     struct segment *segments[] = {&seg, &seg, &seg, &seg, &seg};
     struct playlist pls = {.start_seq_no = 31, .n_segments = 5, .segments = segments,
                            .type = PLS_TYPE_EVENT};
-    HLSContext c = {.live_start_index = -3, .cur_timestamp = AV_NOPTS_VALUE,
+    HLSContext c = {.live_start_index = LIVE_START_INDEX_AUTO, .cur_timestamp = AV_NOPTS_VALUE,
                     .first_timestamp = AV_NOPTS_VALUE, .first_packet = 1};
 
+    av_assert0(select_cur_seq_no(&c, &pls) == 31);
+    /* #EXT-X-START:TIME-OFFSET=-0.6 is ignored without prefer_x_start */
+    pls.time_offset_flag = 1;
+    pls.start_time_offset = -600000;
+    av_assert0(select_cur_seq_no(&c, &pls) == 31);
+    /* with it: 0.6 s before the end of the 1.5 s window */
+    c.prefer_x_start = 1;
+    av_assert0(select_cur_seq_no(&c, &pls) == 34);
+    c.live_start_index = -3;
+    av_assert0(select_cur_seq_no(&c, &pls) == 34);
+    /* live_start_index set by the caller */
+    c.prefer_x_start = 0;
     av_assert0(select_cur_seq_no(&c, &pls) == 33);
+    pls.time_offset_flag = 0;
+    av_assert0(select_cur_seq_no(&c, &pls) == 33);
+    c.live_start_index = 1;
+    av_assert0(select_cur_seq_no(&c, &pls) == 32);
+    /* during playback: by timestamp, as before */
+    c.first_packet = 0;
+    c.cur_timestamp = 650000;
+    pls.last_load_time = av_gettime_relative();
+    av_assert0(select_cur_seq_no(&c, &pls) == 33);
+    c.first_packet = 1;
+    c.cur_timestamp = AV_NOPTS_VALUE;
     pls.finished = 1;
     av_assert0(select_cur_seq_no(&c, &pls) == 31);
+    c.live_start_index = LIVE_START_INDEX_AUTO;
+    av_assert0(select_cur_seq_no(&c, &pls) == 31);
+
+    /* a live playlist: -3 by default, #EXT-X-START with prefer_x_start */
+    pls.finished = 0;
+    pls.type = PLS_TYPE_UNSPECIFIED;
+    av_assert0(select_cur_seq_no(&c, &pls) == 33);
+    c.live_start_index = -3;
+    av_assert0(select_cur_seq_no(&c, &pls) == 33);
+    c.live_start_index = 0;
+    av_assert0(select_cur_seq_no(&c, &pls) == 31);
+    pls.time_offset_flag = 1;
+    c.prefer_x_start = 1;
+    av_assert0(select_cur_seq_no(&c, &pls) == 34);
 }
 
 /* A live rendition without discontinuities that is switched in again: by

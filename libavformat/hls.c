@@ -61,6 +61,10 @@
 #define MPEG_TIME_BASE 90000
 #define MPEG_TIME_BASE_Q (AVRational){1, MPEG_TIME_BASE}
 
+/* live_start_index not set by the caller: -3, but an unfinished EVENT
+ * playlist starts on its first segment */
+#define LIVE_START_INDEX_AUTO INT_MIN
+
 /*
  * An apple http stream consists of a playlist with media segment files,
  * played sequentially. There may be several playlists with the same
@@ -3124,6 +3128,8 @@ static int64_t seq_no_by_anchor(HLSContext *c, struct playlist *pls, int64_t tim
 static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
 {
     int64_t seq_no;
+    int live_start_index = c->live_start_index == LIVE_START_INDEX_AUTO ?
+                           -3 : c->live_start_index;
 
     if (!pls->finished && !c->first_packet &&
         av_gettime_relative() - pls->last_load_time >= default_reload_interval(pls))
@@ -3138,7 +3144,13 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
         return seq_no;
     }
 
-    if (!pls->finished && pls->type != PLS_TYPE_EVENT) {
+    /* An unfinished EVENT playlist starts on its first segment, unless
+     * #EXT-X-START applies or the caller set live_start_index. */
+    if (!pls->finished &&
+        (pls->type != PLS_TYPE_EVENT ||
+         (c->first_packet &&
+          ((pls->time_offset_flag && c->prefer_x_start) ||
+           c->live_start_index != LIVE_START_INDEX_AUTO)))) {
         if (!c->first_packet) { /* we are doing a segment selection during playback */
             int in_window = c->cur_seq_no >= pls->start_seq_no &&
                             c->cur_seq_no < pls->start_seq_no + pls->n_segments;
@@ -3182,11 +3194,11 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
 
         /* If this is a live stream, start live_start_index segments from the
          * start or end */
-        if (c->live_start_index < 0)
+        if (live_start_index < 0)
             seq_no = pls->start_seq_no + FFMAX(pls->n_segments +
-                                            c->live_start_index, 0);
+                                            live_start_index, 0);
         else
-            seq_no = pls->start_seq_no + FFMIN(c->live_start_index,
+            seq_no = pls->start_seq_no + FFMIN(live_start_index,
                                             pls->n_segments - 1);
 
         /* If #EXT-X-START in playlist, need to recalculate */
@@ -4544,7 +4556,8 @@ static const AVOption hls_options[] = {
     {"hls_audio_default_only", "Only open default audio renditions when a group has a default",
         OFFSET(hls_audio_default_only), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, FLAGS},
     {"live_start_index", "segment index to start live streams at (negative values are from the end)",
-        OFFSET(live_start_index), AV_OPT_TYPE_INT, {.i64 = -3}, INT_MIN, INT_MAX, FLAGS},
+        OFFSET(live_start_index), AV_OPT_TYPE_INT, {.i64 = LIVE_START_INDEX_AUTO}, INT_MIN, INT_MAX, FLAGS, .unit = "live_start_index"},
+    {"auto", "-3, the first segment for EVENT playlists", 0, AV_OPT_TYPE_CONST, {.i64 = LIVE_START_INDEX_AUTO}, 0, 0, FLAGS, .unit = "live_start_index"},
     {"prefer_x_start", "prefer to use #EXT-X-START if it's in playlist instead of live_start_index",
         OFFSET(prefer_x_start), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS},
     {"allowed_extensions", "List of file extensions that hls is allowed to access",

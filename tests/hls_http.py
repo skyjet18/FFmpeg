@@ -416,6 +416,102 @@ def check_sequence_wrap(ffmpeg):
         print(f"PASS HLS live sequence wrap 1000 -> 10 with prefetch: resynced to {new[0]}")
 
 
+def check_event_start(ffmpeg):
+    """The first segment read from an unfinished playlist of six 1 s
+    segments: an EVENT playlist starts on its first segment, unless
+    #EXT-X-START applies (prefer_x_start) or live_start_index is set; a
+    live playlist starts three segments from the end or at #EXT-X-START,
+    a finished playlist on its first segment. Every later load of the
+    playlist is finished, so that the reading ends."""
+    cases = [("event", None, (), 0),
+             ("event", None, ("-live_start_index", "auto"), 0),
+             ("event", -2, (), 0),
+             ("event", -2, ("-prefer_x_start", "1"), 4),
+             ("event", None, ("-live_start_index", "-3"), 3),
+             ("event", None, ("-live_start_index", "1"), 1),
+             ("live", None, (), 3),
+             ("live", None, ("-live_start_index", "-3"), 3),
+             ("live", -2, ("-prefer_x_start", "1"), 4),
+             ("vod", None, ("-live_start_index", "-3"), 0)]
+    with tempfile.TemporaryDirectory(prefix="ffmpeg-hls-event-") as directory:
+        root = Path(directory)
+        (root / "video.raw").write_bytes(bytes([96]) * (64 * 64 * 3 // 2 * 25 * 6))
+        run(ffmpeg, "-y", "-f", "rawvideo", "-pixel_format", "yuv420p", "-video_size", "64x64",
+            "-framerate", "25", "-i", str(root / "video.raw"),
+            "-c:v", "mpeg2video", "-g", "25", "-bf", "0",
+            "-f", "hls", "-hls_time", "1", "-hls_list_size", "0",
+            "-hls_segment_filename", str(root / "seg-%03d.ts"), str(root / "seg.m3u8"))
+        assert len(list(root.glob("seg-*.ts"))) >= 6, sorted(root.iterdir())
+
+        def playlist(kind, offset, finished):
+            return ("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:1\n"
+                    "#EXT-X-MEDIA-SEQUENCE:0\n"
+                    + ("#EXT-X-PLAYLIST-TYPE:EVENT\n" if kind == "event" else "")
+                    + (f"#EXT-X-START:TIME-OFFSET={offset}\n" if offset is not None else "")
+                    + "".join(f"#EXTINF:1.000000,\nseg-{index:03d}.ts\n" for index in range(6))
+                    + ("#EXT-X-ENDLIST\n" if finished else "")).encode()
+
+        class EventHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                path = self.path.lstrip("/")
+                requested.append(path)
+                match = re.fullmatch(r"(\d+)\.m3u8", path)
+                if match:
+                    kind, offset, _, _ = cases[int(match[1])]
+                    data = playlist(kind, offset, kind == "vod" or requested.count(path) > 1)
+                elif re.fullmatch(r"seg-\d+\.ts", path):
+                    data = (root / path).read_bytes()
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def handle(self):
+                try:
+                    super().handle()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+            def log_message(self, *_):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), EventHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        failed = []
+        try:
+            for number, (kind, offset, options, expected) in enumerate(cases):
+                requested = []
+                result = subprocess.run(
+                    [ffmpeg, "-nostdin", "-hide_banner", "-v", "warning", *options,
+                     "-i", f"http://127.0.0.1:{server.server_port}/{number}.m3u8",
+                     "-map", "0", "-c", "copy", "-f", "null", "-"],
+                    capture_output=True, timeout=60)
+                log = result.stderr.decode(errors="replace")[-4000:]
+                segments = [int(path[4:7]) for path in requested if path.startswith("seg-")]
+                name = (f"{kind}" + (f" EXT-X-START:TIME-OFFSET={offset}" if offset is not None else "")
+                        + (" " + " ".join(options) if options else ""))
+                if result.returncode or not segments or segments[0] != expected:
+                    print(f"FAIL HLS start of {name}: expected segment {expected}, "
+                          f"read {segments[:1]} (exit {result.returncode})")
+                    failed.append((name, requested, log))
+                else:
+                    print(f"PASS HLS start of {name}: segment {expected}")
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        assert not failed, failed
+
+
 def check_tls(ffmpeg):
     """The TLS options of the master playlist reach variant playlists, keys and segments."""
     if not shutil.which("openssl") or not re.search(
@@ -729,7 +825,8 @@ def check_cenc(ffmpeg):
 
 def main():
     checks = {"dead_key": check_dead_key, "key_scheme": check_key_scheme,
-              "sequence_wrap": check_sequence_wrap, "tls": check_tls,
+              "sequence_wrap": check_sequence_wrap, "event_start": check_event_start,
+              "tls": check_tls,
               "low_speed": check_low_speed, "cenc": check_cenc,
               "mixed": None, "image_head": check_image_head}
     parser = argparse.ArgumentParser(description=__doc__)
