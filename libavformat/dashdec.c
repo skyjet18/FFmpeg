@@ -27,6 +27,7 @@
 #include "libavutil/opt.h"
 #include "libavutil/time.h"
 #include "libavutil/parseutils.h"
+#include "libavutil/uuid.h"
 #include "internal.h"
 #include "avio_internal.h"
 #include "dash.h"
@@ -138,6 +139,7 @@ struct representation {
     char *cenc_decryption_key;
     char *cenc_decryption_keys;
     char *cenc_pssh; /* base64 pssh boxes of the ContentProtection elements, comma separated */
+    char *cenc_kid; /* default_KID of a ContentProtection element, as hex */
     enum AVMediaType type;
 };
 
@@ -443,6 +445,7 @@ static void free_representation(struct representation *pls)
     av_freep(&pls->cenc_decryption_key);
     av_freep(&pls->cenc_decryption_keys);
     av_freep(&pls->cenc_pssh);
+    av_freep(&pls->cenc_kid);
     av_freep(&pls);
 }
 
@@ -804,6 +807,35 @@ static int add_content_protection_pssh(char **pssh, xmlNodePtr node)
             av_free(*pssh);
             *pssh = joined;
         }
+    }
+    return 0;
+}
+
+static int add_content_protection_kid(AVFormatContext *s, char **kid, xmlNodePtr node)
+{
+    for (xmlNodePtr cp = node ? xmlFirstElementChild(node) : NULL; cp; cp = xmlNextElementSibling(cp)) {
+        AVUUID kid_bytes;
+        char kid_hex[AV_UUID_LEN * 2 + 1];
+        xmlChar *default_kid;
+
+        if (av_strcasecmp(cp->name, "ContentProtection") || *kid)
+            continue;
+        default_kid = xmlGetNsProp(cp, "default_KID", "urn:mpeg:cenc:2013");
+        if (!default_kid)
+            default_kid = xmlGetProp(cp, "default_KID");
+        if (!default_kid)
+            continue;
+        if (av_uuid_parse((const char *)default_kid, kid_bytes)) {
+            av_log(s, AV_LOG_WARNING, "Invalid cenc:default_KID '%s'\n", default_kid);
+            xmlFree(default_kid);
+            continue;
+        }
+        ff_data_to_hex(kid_hex, kid_bytes, AV_UUID_LEN, 1);
+        kid_hex[sizeof(kid_hex) - 1] = 0;
+        *kid = av_strdup(kid_hex);
+        xmlFree(default_kid);
+        if (!*kid)
+            return AVERROR(ENOMEM);
     }
     return 0;
 }
@@ -1256,7 +1288,9 @@ static int parse_manifest_representation(AVFormatContext *s, const char *url,
 
     if (c->cenc_decryption_key_url &&
         (add_content_protection_pssh(&rep->cenc_pssh, adaptionset_node) < 0 ||
-         add_content_protection_pssh(&rep->cenc_pssh, representation_node) < 0))
+         add_content_protection_pssh(&rep->cenc_pssh, representation_node) < 0 ||
+         add_content_protection_kid(s, &rep->cenc_kid, representation_node) < 0 ||
+         add_content_protection_kid(s, &rep->cenc_kid, adaptionset_node) < 0))
         goto enomem;
 
     baseurl_nodes[0] = mpd_baseurl_node;
@@ -2753,6 +2787,8 @@ static int reopen_demux_for_component(AVFormatContext *s, struct representation 
         av_dict_set(&in_fmt_opts, "decryption_key_url", c->cenc_decryption_key_url, 0);
         if (pls->cenc_pssh)
             av_dict_set(&in_fmt_opts, "decryption_pssh", pls->cenc_pssh, 0);
+        if (pls->cenc_kid)
+            av_dict_set(&in_fmt_opts, "decryption_kid", pls->cenc_kid, 0);
     }
 
     if (pls->cenc_decryption_key)
