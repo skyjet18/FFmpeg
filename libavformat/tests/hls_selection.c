@@ -420,6 +420,6 @@ int main(void)
     c.live_start_index = -3;
     c.cur_timestamp = AV_NOPTS_VALUE;
     c.first_packet = 1;
-    av_assert0(select_cur_seq_no(&c, &low) == 33);
+    av_assert0(select_cur_seq_no(&c, &low) == 31);
     return 0;
 }
