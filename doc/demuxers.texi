@@ -612,6 +612,8 @@ a default retain all renditions. Disabled by default.
 
 @item live_start_index
 segment index to start live streams at (negative values are from the end).
+If not set, live streams start at -3 and unfinished EVENT playlists start at
+their first segment (unless #EXT-X-START applies with @option{prefer_x_start}).
 
 @item prefer_x_start
 prefer to use #EXT-X-START if it's in playlist instead of live_start_index.
