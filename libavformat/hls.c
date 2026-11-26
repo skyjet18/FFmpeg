@@ -2194,12 +2194,12 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
     /* If playback is already in progress (we are just selecting a new
      * playlist) and this is a complete file, find the matching segment
      * by counting durations. */
-    if (pls->finished && c->cur_timestamp != AV_NOPTS_VALUE) {
+    if ((pls->finished || pls->type == PLS_TYPE_EVENT) && c->cur_timestamp != AV_NOPTS_VALUE) {
         find_timestamp_in_playlist(c, pls, c->cur_timestamp, &seq_no, NULL);
         return seq_no;
     }
 
-    if (!pls->finished) {
+    if (!pls->finished && pls->type != PLS_TYPE_EVENT) {
         if (!c->first_packet && c->cur_timestamp != AV_NOPTS_VALUE) {
             find_timestamp_in_playlist(c, pls, c->cur_timestamp, &seq_no, NULL);
             return seq_no;
@@ -2874,7 +2874,8 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
                     return ret;
             }
             if (pls->is_subtitle &&
-                !pls->finished && pls->window_start_timestamp == AV_NOPTS_VALUE &&
+                !pls->finished && pls->type != PLS_TYPE_EVENT &&
+                pls->window_start_timestamp == AV_NOPTS_VALUE &&
                 pls->n_segments) {
                 if (c->live_start_index < 0)
                     seq_no = pls->start_seq_no + FFMAX(pls->n_segments +
