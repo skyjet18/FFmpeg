@@ -3138,7 +3138,7 @@ static int64_t select_cur_seq_no(HLSContext *c, struct playlist *pls)
         return seq_no;
     }
 
-    if (!pls->finished) {
+    if (!pls->finished && pls->type != PLS_TYPE_EVENT) {
         if (!c->first_packet) { /* we are doing a segment selection during playback */
             int in_window = c->cur_seq_no >= pls->start_seq_no &&
                             c->cur_seq_no < pls->start_seq_no + pls->n_segments;
