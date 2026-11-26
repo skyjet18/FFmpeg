@@ -299,6 +299,9 @@ the mov demuxer. The requests go through the @code{io_open} callback of this
 context; every key ID is requested once for the whole stream. The @code{cenc:pssh}
 boxes of the @code{ContentProtection} elements of the AdaptationSet and the
 Representation are part of @code{@{pssh@}}.
+The MPD may also provide a @code{cenc_decryption_key_url} element, which
+overrides this option. Relative URLs in that element are resolved against the
+manifest URL after redirects.
 
 @item dash_subtitle_default_discard
 Initially discard all manifest subtitle representations, including unprobed
@@ -676,6 +679,9 @@ Default value is 0.
 URL template that the mov demuxer of fMP4 segments in CENC opens for the key of a key ID it
 has no key for; see @option{decryption_key_url} of the mov demuxer. The requests go through
 the @code{io_open} callback of this context; every key ID is requested once.
+The @code{#EXT-X-CENC-DECRYPTION-KEY-URL} playlist tag overrides this option.
+Relative URLs in the tag are resolved against the URL of the playlist containing
+it, after redirects.
 
 The @code{EXT-X-KEY} tags of these segments are part of the request: the @code{data:} URI of a
 tag whose @code{KEYFORMAT} is a DRM system (@code{urn:uuid:@var{system id}}, e.g. Widevine, or

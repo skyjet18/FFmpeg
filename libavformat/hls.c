@@ -1371,6 +1371,31 @@ static int parse_playlist(HLSContext *c, const char *url,
                 pls->type = PLS_TYPE_EVENT;
             else if (!strcmp(ptr, "VOD"))
                 pls->type = PLS_TYPE_VOD;
+        } else if (av_strstart(line, "#EXT-X-CENC-DECRYPTION-KEY-URL:", &ptr)) {
+            /* takes priority over the cenc_decryption_key_url option */
+            if (*ptr) {
+                size_t base_len = strlen(url);
+                size_t val_len = strlen(ptr);
+                char *key_url;
+
+                if (base_len >= INT_MAX || val_len >= INT_MAX - base_len - 1) {
+                    ret = AVERROR(ENOMEM);
+                    goto fail;
+                }
+                key_url = av_malloc(base_len + val_len + 2);
+                if (!key_url) {
+                    ret = AVERROR(ENOMEM);
+                    goto fail;
+                }
+                ret = ff_make_absolute_url(key_url, base_len + val_len + 2, url, ptr);
+                if (ret < 0) {
+                    av_log(c->ctx, AV_LOG_ERROR, "Invalid playlist key URL '%s'\n", ptr);
+                    av_free(key_url);
+                    goto fail;
+                }
+                av_free(c->cenc_decryption_key_url);
+                c->cenc_decryption_key_url = key_url;
+            }
         } else if (av_strstart(line, "#EXT-X-MAP:", &ptr)) {
             struct init_section_info info = {{0}};
             ret = ensure_playlist(c, &pls, url);

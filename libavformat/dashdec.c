@@ -1735,6 +1735,38 @@ static int parse_manifest(AVFormatContext *s, const char *url, AVIOContext *in)
                 }
             } else if (!av_strcasecmp(node->name, "ProgramInformation")) {
                 parse_programinformation(s, node);
+            } else if (!av_strcasecmp(node->name, "cenc_decryption_key_url")) {
+                /* the manifest takes priority over the option */
+                val = xmlNodeGetContent(node);
+                if (val && *val) {
+                    size_t base_len = c->base_url ? strlen(c->base_url) : 0;
+                    size_t val_len = strlen(val);
+                    char *key_url;
+
+                    if (!c->base_url || base_len >= INT_MAX ||
+                        val_len >= INT_MAX - base_len - 1) {
+                        xmlFree(val);
+                        ret = AVERROR(ENOMEM);
+                        goto cleanup;
+                    }
+                    key_url = av_malloc(base_len + val_len + 2);
+                    if (!key_url) {
+                        xmlFree(val);
+                        ret = AVERROR(ENOMEM);
+                        goto cleanup;
+                    }
+                    ret = ff_make_absolute_url(key_url, base_len + val_len + 2,
+                                               c->base_url, val);
+                    if (ret < 0) {
+                        av_log(s, AV_LOG_ERROR, "Invalid manifest key URL '%s'\n", val);
+                        av_free(key_url);
+                        xmlFree(val);
+                        goto cleanup;
+                    }
+                    av_free(c->cenc_decryption_key_url);
+                    c->cenc_decryption_key_url = key_url;
+                }
+                xmlFree(val);
             }
             node = xmlNextElementSibling(node);
         }

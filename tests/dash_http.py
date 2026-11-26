@@ -140,6 +140,7 @@ def check_cenc_key_request(ffmpeg, top):
 
     answers = {}
     requests = []
+    key_paths = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -147,11 +148,21 @@ def check_cenc_key_request(ffmpeg, top):
         def do_GET(self):
             url = urlsplit(self.path)
             status, payload = 200, b""
-            if url.path == "/key":
+            redirects = {"/redirect.mpd": "/nested/keys.mpd",
+                         "/redirect-master.m3u8": "/nested/master.m3u8",
+                         "/redirect-media.m3u8": "/b/tagged.m3u8"}
+            if url.path in redirects:
+                self.send_response(302)
+                self.send_header("Location", redirects[url.path])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if url.path in ("/key", "/nested/key", "/b/key"):
                 query = parse_qs(url.query, keep_blank_values=True)
                 kid = query["kid"][0]
                 pssh = base64.b64decode(query["pssh"][0]) if query.get("pssh", [""])[0] else b""
                 requests.append((kid, query.get("type", [None])[0], pssh))
+                key_paths.append(url.path)
                 answer = answers.get(kid, 404)
                 if isinstance(answer, list):  # one answer per request, the last one stays
                     answer = answer.pop(0) if len(answer) > 1 else answer[0]
@@ -226,6 +237,33 @@ def check_cenc_key_request(ffmpeg, top):
         print("PASS CENC key request, DASH: one request per KID for three representations, "
               "hex and binary answers, MPD pssh boxes per KID")
 
+        nested = root / "nested"
+        nested.mkdir()
+        nested_mpd = ET.fromstring(ET.tostring(mpd))
+        for template in nested_mpd.findall(".//d:SegmentTemplate", ns):
+            for attribute in ("initialization", "media"):
+                template.set(attribute, "../" + template.get(attribute))
+        manifest_key = ET.SubElement(nested_mpd, f"{{{ns['d']}}}cenc_decryption_key_url")
+        query = "?kid={kid}&type={type}&pssh={pssh}"
+        for template, manifest_path, expected_path in (
+            ("key" + query, "/nested/keys.mpd?token=manifest", "/nested/key"),
+            ("../key" + query, "/nested/keys.mpd", "/key"),
+            ("/key" + query, "/nested/keys.mpd", "/key"),
+            (key_url, "/nested/keys.mpd", "/key"),
+            (f"//127.0.0.1:{server.server_port}/key" + query, "/nested/keys.mpd", "/key"),
+            ("key" + query, "/redirect.mpd", "/nested/key"),
+        ):
+            manifest_key.text = template
+            (nested / "keys.mpd").write_bytes(ET.tostring(nested_mpd))
+            key_paths.clear()
+            code, streams, log = read("-cenc_decryption_key_url", base + "/wrong-key",
+                                      "-i", base + manifest_path)
+            assert code == 0 and len(streams) == 3, (template, log)
+            assert decrypted(streams[0], "a") and decrypted(streams[1], "b") and decrypted(streams[2], "b"), log
+            assert key_paths == [expected_path, expected_path], (template, key_paths, log)
+            assert sorted(kid for kid, _, _ in requests) == sorted([kid_a, kid_b]), requests
+        print("PASS DASH manifest key URL: relative, absolute, and redirected manifest URLs")
+
         # a KID without a key: a clear error; its packets come encrypted with
         # their encryption info, the other streams play on. A refused request
         # or an answer that is not a key is final (one request); a 404 is
@@ -278,6 +316,34 @@ def check_cenc_key_request(ffmpeg, top):
         assert len(streams) == 1 and decrypted(streams[0], "b"), (streams.keys(), log)
         assert [(kid, kind, pssh) for kid, kind, pssh in requests] == [(kid_b, "audio", b"")], requests
         print("PASS CENC key request, HLS fMP4: the key of the KID requested once")
+
+        media = (root / "b" / "media_0.m3u8").read_text()
+        for location, template, playlist_url, expected_path in (
+            ("master", "key" + query, "/nested/master.m3u8?token=manifest", "/nested/key"),
+            ("master", "../key" + query, "/nested/master.m3u8", "/key"),
+            ("master", "/key" + query, "/nested/master.m3u8", "/key"),
+            ("master", key_url, "/nested/master.m3u8", "/key"),
+            ("master", f"//127.0.0.1:{server.server_port}/key" + query, "/nested/master.m3u8", "/key"),
+            ("master", "key" + query, "/redirect-master.m3u8", "/nested/key"),
+            ("media", "key" + query, "/b/tagged.m3u8", "/b/key"),
+            ("media", "key" + query, "/nested/master.m3u8", "/b/key"),
+            ("media", "key" + query, "/redirect-media.m3u8", "/b/key"),
+            ("media", "", "/b/tagged.m3u8", "/key"),
+        ):
+            tag = f"#EXT-X-CENC-DECRYPTION-KEY-URL:{template}\n"
+            master_tag = tag if location == "master" else ""
+            media_tag = tag if location == "media" else ""
+            (nested / "master.m3u8").write_text(
+                f"#EXTM3U\n{master_tag}#EXT-X-STREAM-INF:BANDWIDTH=96000\n/b/tagged.m3u8\n")
+            (root / "b" / "tagged.m3u8").write_text(
+                media.replace("#EXTM3U\n", "#EXTM3U\n" + media_tag, 1))
+            key_paths.clear()
+            fallback = key_url if not template else base + "/wrong-key"
+            code, streams, log = read("-cenc_decryption_key_url", fallback, "-i", base + playlist_url)
+            assert code == 0 and len(streams) == 1 and decrypted(streams[0], "b"), (template, log)
+            assert key_paths == [expected_path], (template, key_paths, log)
+            assert requests == [(kid_b, "audio", b"")], requests
+        print("PASS HLS playlist key URL: master/media, relative, absolute, redirects, and empty tag")
 
         # HLS with CENC key tags: the init segments have no KID (tenc all
         # zeros) and no pssh, the KEYID and the data: URIs of the tags are
