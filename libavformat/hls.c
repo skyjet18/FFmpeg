@@ -205,6 +205,10 @@ struct playlist {
     unsigned int init_sec_buf_size;
     unsigned int init_sec_data_len;
     unsigned int init_sec_buf_read_offset;
+    /* After a seek the segment demuxer needs the init section again: it is
+     * served again from init_sec_buf when the segment seeked to has the same
+     * one, and downloaded only when it has another one. */
+    int init_sec_resend;
 
     /* The start of the segment that skip_image_head() read: head_buf holds
      * head_len bytes, read_from_url() returns those from head_pos on before
@@ -2359,9 +2363,14 @@ static int update_init_section(struct playlist *pls, struct segment *seg)
     int64_t urlsize;
     int ret;
 
-    if (seg->init_section == pls->cur_init_section)
+    if (seg->init_section == pls->cur_init_section) {
+        if (pls->init_sec_resend && pls->cur_init_section)
+            pls->init_sec_buf_read_offset = 0;
+        pls->init_sec_resend = 0;
         return 0;
+    }
 
+    pls->init_sec_resend = 0;
     pls->cur_init_section = NULL;
 
     if (!seg->init_section)
@@ -3981,8 +3990,9 @@ static void reset_playlist(struct playlist *pls)
     if (pls->is_subtitle)
         avformat_close_input(&pls->ctx);
 
-    /* Reset the init segment so it's re-fetched and served appropriately */
-    pls->cur_init_section = NULL;
+    /* The init section is served again before the segment seeked to; it is
+     * only fetched again when that segment has another one */
+    pls->init_sec_resend = 1;
 }
 
 static int recheck_discard_flags(AVFormatContext *s, int first)
