@@ -26,7 +26,7 @@ ret: 0         st: 1 flags:1 dts: 1.400000 pts: 1.500000 pos:    564 size:  3913
 ret: 0         st:-1 flags:0  ts: 3.730004
 ret: 0         st: 0 flags:1 dts: 3.735622 pts: 3.735622 pos:     -1 size:  1254
 ret: 0         st:-1 flags:1  ts: 4.624171
-ret: 0         st: 0 flags:1 dts: 4.493178 pts: 4.493178 pos:  50572 size:  1254
+ret: 0         st: 1 flags:1 dts: 4.200000 pts: 4.500000 pos:    564 size:  5196
 ret: 0         st: 0 flags:0  ts:-0.481667
 ret: 0         st: 1 flags:1 dts: 1.400000 pts: 1.500000 pos:    564 size:  3913
 ret: 0         st: 0 flags:1  ts: 0.412500
