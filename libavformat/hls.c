@@ -258,6 +258,11 @@ struct playlist {
     int64_t seek_timestamp;
     int seek_flags;
     int seek_stream_index; /* into main demuxer stream array */
+    /* A backward seek of a video stream lands on the first keyframe of the
+     * segment seeked to, whatever its timestamp: the segment start computed
+     * from the playlist durations and c->first_timestamp can lie a few
+     * frames after the DTS of that keyframe. */
+    int seek_first_key;
 
     /* Renditions associated with this playlist, if any.
      * Alternative rendition playlists have a single rendition associated
@@ -4039,6 +4044,7 @@ static int recheck_discard_flags(AVFormatContext *s, int first)
                     (pls->ts_offset != AV_NOPTS_VALUE ? pls->ts_offset : 0);
                 pls->seek_flags = AVSEEK_FLAG_ANY;
                 pls->seek_stream_index = -1;
+                pls->seek_first_key = 0;
             }
             av_log(s, AV_LOG_INFO, "Now receiving playlist %d, segment %"PRId64"\n", i, pls->cur_seq_no);
         } else if ((first || pls->is_subtitle) && !cur_needed && pls->needed) {
@@ -4312,6 +4318,13 @@ static int hls_read_packet(AVFormatContext *s, AVPacket *pkt)
                         break;
                     }
 
+                    if (pls->seek_first_key &&
+                        pls->pkt->flags & AV_PKT_FLAG_KEY) {
+                        pls->seek_first_key = 0;
+                        pls->seek_timestamp = AV_NOPTS_VALUE;
+                        break;
+                    }
+
                     tb = get_timebase(pls);
                     ts_diff = av_rescale_rnd(pls->pkt->dts, AV_TIME_BASE,
                                             tb.den, AV_ROUND_DOWN) -
@@ -4442,6 +4455,7 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
     int i, j;
     int64_t first_timestamp, seek_timestamp, duration;
     int64_t seq_no, seg_start_ts;
+    int first_key = 0;
 
     if ((flags & AVSEEK_FLAG_BYTE) || (c->ctx->ctx_flags & AVFMTCTX_UNSEEKABLE))
         return AVERROR(ENOSYS);
@@ -4479,6 +4493,12 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         /* Seeking to start of segment ensures we seek to a keyframe located
          * before the given timestamp. */
         seek_timestamp = seg_start_ts;
+        /* seg_start_ts adds the playlist durations to c->first_timestamp,
+         * the DTS of the first packet read (maybe of another stream); the
+         * keyframe that opens the segment can have a DTS a few frames below
+         * it (B-frame delay, rounded durations), so it is taken as the first
+         * keyframe, not by its timestamp. */
+        first_key = 1;
     }
 
     /* set segment now so we do not need to search again below */
@@ -4510,6 +4530,7 @@ static int hls_read_seek(AVFormatContext *s, int stream_index,
         else
             pls->seek_timestamp = seek_timestamp;
         pls->seek_flags = flags;
+        pls->seek_first_key = pls == seek_pls && first_key;
 
         if (pls != seek_pls) {
             /* set closest segment seq_no for playlists not handled above */
